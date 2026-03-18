@@ -31,7 +31,8 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 
 	// ─── Services ─────────────────────────────────────────────────────────────
 	authService := service.NewAuthService(authRepo, jwtUtil)
-	pickupService := service.NewPickupService(pickupRepo, categoryRepo, authRepo, storageClient, cfg.StorageBucket)
+	pickupService := service.NewPickupService(pickupRepo, storageClient, cfg.StorageBucket)
+	adminService := service.NewAdminService(authRepo, pickupRepo, jwtUtil)
 	voucherService := service.NewVoucherService(voucherRepo, authRepo)
 	pointLogService := service.NewPointLogService(pointLogRepo)
 	categoryService := service.NewWasteCategoryService(categoryRepo)
@@ -39,6 +40,7 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 	// ─── Handlers ─────────────────────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService)
 	pickupHandler := handler.NewPickupHandler(pickupService)
+	adminHandler := handler.NewAdminHandler(adminService)
 	voucherHandler := handler.NewVoucherHandler(voucherService)
 	pointLogHandler := handler.NewPointLogHandler(pointLogService)
 	categoryHandler := handler.NewWasteCategoryHandler(categoryService)
@@ -103,6 +105,18 @@ func New(cfg *config.Config, db *pgxpool.Pool) *Server {
 		collectorRoutes.GET("pickups/my-tasks", pickupHandler.GetMyTasks)
 		collectorRoutes.POST("pickups/:id/take", pickupHandler.TakeTask)
 		collectorRoutes.POST("pickups/:id/complete", pickupHandler.CompleteTask)
+	}
+
+	// ─── Admin-only routes ────────────────────────────────────────────────────
+	adminRoutes := v1.Group("/admin")
+	adminRoutes.Use(middleware.AuthMiddleware(jwtUtil))
+	adminRoutes.Use(middleware.RequireRole("admin"))
+	{
+		adminRoutes.POST("collectors", adminHandler.CreateCollector)
+		adminRoutes.GET("collectors", adminHandler.ListCollectors)
+		adminRoutes.DELETE("collectors/:id", adminHandler.DeleteCollector)
+		adminRoutes.GET("stats", adminHandler.GetDashboardStats)
+		adminRoutes.GET("pickups", adminHandler.ListAllPickups)
 	}
 
 	return &Server{router: router, cfg: cfg}

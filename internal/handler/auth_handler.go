@@ -46,13 +46,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.authService.Login(c.Request.Context(), &req)
+	authResp, err := h.authService.Login(c.Request.Context(), req.Email, req.Password)  // ← FIXED
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
 	}
 
-	utils.RespondSuccess(c, http.StatusOK, "Login successful", resp)
+	utils.RespondSuccess(c, http.StatusOK, "Login successful", authResp)
 }
 
 // GetProfile godoc

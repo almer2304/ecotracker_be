@@ -3,26 +3,43 @@ package config
 import (
 	"context"
 	"fmt"
-	"log"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func NewDBPool(dbURL string) (*pgxpool.Pool, error) {
-	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	// Parse config
+	config, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse DB URL: %w", err)
+		return nil, fmt.Errorf("parse db config: %w", err)
 	}
 
-	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
+	// Configure connection pool
+	config.MaxConns = 10
+	config.MinConns = 2
+	config.MaxConnLifetime = time.Hour
+	config.MaxConnIdleTime = 30 * time.Minute
+	config.HealthCheckPeriod = 1 * time.Minute
+
+	// ✅ FIX: Use simple protocol to avoid prepared statement cache
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	// Create pool
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create connection pool: %w", err)
+		return nil, fmt.Errorf("create connection pool: %w", err)
 	}
 
-	if err := pool.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("unable to ping database: %w", err)
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	log.Println("✅ Database connected successfully")
+	fmt.Println("✓ Database connected successfully")
 	return pool, nil
 }

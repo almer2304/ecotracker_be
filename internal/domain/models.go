@@ -158,3 +158,14 @@ type JWTClaims struct {
 	Email  string `json:"email"`
 	Role   string `json:"role"`
 }
+
+// ─── Admin ───────────────────────────────────────────────────────────────────
+
+// AdminStats for dashboard
+type AdminStats struct {
+	TotalUsers         int `json:"total_users"`
+	TotalCollectors    int `json:"total_collectors"`
+	PendingPickups     int `json:"pending_pickups"`
+	CompletedPickups   int `json:"completed_pickups"`
+	TotalPointsAwarded int `json:"total_points_awarded"`
+}

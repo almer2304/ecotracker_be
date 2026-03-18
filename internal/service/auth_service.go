@@ -23,67 +23,96 @@ func NewAuthService(authRepo *repository.AuthRepository, jwtUtil *utils.JWTUtil)
 	}
 }
 
-// Register creates a new profile with hashed password
+// Register creates a new user account
 func (s *AuthService) Register(ctx context.Context, req *domain.RegisterRequest) (*domain.AuthResponse, error) {
-	// Check for duplicate email
+	// Check if email already exists
 	exists, err := s.authRepo.EmailExists(ctx, req.Email)
 	if err != nil {
-		return nil, fmt.Errorf("register check email: %w", err)
+		return nil, fmt.Errorf("check email: %w", err)
 	}
 	if exists {
-		return nil, domain.ErrConflict
+		return nil, domain.ErrEmailAlreadyExists
 	}
 
 	// Hash password
-	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
+	// Create profile
 	profile := &domain.Profile{
 		Name:         req.Name,
 		Email:        req.Email,
 		Phone:        req.Phone,
 		Role:         req.Role,
-		PasswordHash: string(hashed),
+		PasswordHash: string(hashedPassword),
 	}
 
 	if err := s.authRepo.CreateProfile(ctx, profile); err != nil {
-		return nil, fmt.Errorf("create profile: %w", err)
+		return nil, fmt.Errorf("create user: %w", err)
 	}
 
+	// Generate JWT token
 	token, err := s.jwtUtil.GenerateToken(profile.ID, profile.Email, profile.Role)
 	if err != nil {
 		return nil, fmt.Errorf("generate token: %w", err)
 	}
 
-	return &domain.AuthResponse{Token: token, Profile: profile}, nil
+	// Return response without password hash
+	profile.PasswordHash = ""
+
+	return &domain.AuthResponse{
+		Token:   token,
+		Profile: profile,
+	}, nil
 }
 
-// Login validates credentials and returns a JWT token
-func (s *AuthService) Login(ctx context.Context, req *domain.LoginRequest) (*domain.AuthResponse, error) {
-	profile, err := s.authRepo.GetProfileByEmail(ctx, req.Email)
+// Login authenticates a user
+func (s *AuthService) Login(ctx context.Context, email, password string) (*domain.AuthResponse, error) {
+	fmt.Printf("[LOGIN DEBUG] Email: %s\n", email)
+	
+	// Get user by email
+	user, err := s.authRepo.GetProfileByEmail(ctx, email)
 	if err != nil {
+		fmt.Printf("[LOGIN ERROR] User not found: %v\n", err)
 		return nil, domain.ErrInvalidCredentials
 	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(profile.PasswordHash), []byte(req.Password)); err != nil {
+	
+	fmt.Printf("[LOGIN DEBUG] User found: %s (ID: %s)\n", user.Email, user.ID)
+	
+	// Verify password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		fmt.Printf("[LOGIN ERROR] Password mismatch: %v\n", err)
 		return nil, domain.ErrInvalidCredentials
 	}
-
-	token, err := s.jwtUtil.GenerateToken(profile.ID, profile.Email, profile.Role)
+	
+	fmt.Printf("[LOGIN SUCCESS] Password verified!\n")
+	
+	// Generate token
+	token, err := s.jwtUtil.GenerateToken(user.ID, user.Email, user.Role)
 	if err != nil {
 		return nil, fmt.Errorf("generate token: %w", err)
 	}
-
-	return &domain.AuthResponse{Token: token, Profile: profile}, nil
+	
+	// Return response without password hash
+	user.PasswordHash = ""
+	
+	return &domain.AuthResponse{
+		Token:   token,
+		Profile: user,
+	}, nil
 }
 
-// GetProfile returns the profile for the given user ID
+// GetProfile fetches user profile by ID
 func (s *AuthService) GetProfile(ctx context.Context, userID string) (*domain.Profile, error) {
 	profile, err := s.authRepo.GetProfileByID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get profile: %w", err)
 	}
+	
+	// Don't return password hash
+	profile.PasswordHash = ""
+	
 	return profile, nil
 }

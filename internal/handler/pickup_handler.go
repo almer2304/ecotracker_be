@@ -59,13 +59,11 @@ func (h *PickupHandler) GetMyPickups(c *gin.Context) {
 
 // GetPickupDetail godoc
 // GET /api/v1/pickups/:id
-// Role: user (own only), collector (all)
+// Role: user or collector (depending on ownership/assignment)
 func (h *PickupHandler) GetPickupDetail(c *gin.Context) {
 	pickupID := c.Param("id")
-	userID := middleware.GetUserID(c)
-	userRole := middleware.GetUserRole(c)
-
-	detail, err := h.pickupService.GetPickupDetail(c.Request.Context(), pickupID, userID, userRole)
+	
+	detail, err := h.pickupService.GetPickupDetail(c.Request.Context(), pickupID)
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
@@ -73,42 +71,45 @@ func (h *PickupHandler) GetPickupDetail(c *gin.Context) {
 	utils.RespondSuccess(c, http.StatusOK, "Pickup detail retrieved", detail)
 }
 
-// ─── Collector Endpoints ──────────────────────────────────────────────────────
-
 // GetPendingPickups godoc
 // GET /api/v1/collector/pickups/pending
-// Query params: ?lat=xxx&lon=xxx (optional, for distance sorting)
 // Role: collector
+// Query params: ?lat=<latitude>&lon=<longitude> (optional)
 func (h *PickupHandler) GetPendingPickups(c *gin.Context) {
+	// Check for GPS coordinates in query params
 	latStr := c.Query("lat")
 	lonStr := c.Query("lon")
 
-	// If location provided, return sorted by distance
+	// If GPS coordinates provided, return sorted by distance
 	if latStr != "" && lonStr != "" {
-		lat, errLat := strconv.ParseFloat(latStr, 64)
-		lon, errLon := strconv.ParseFloat(lonStr, 64)
-
-		if errLat != nil || errLon != nil {
-			utils.RespondError(c, http.StatusBadRequest, fmt.Errorf("invalid latitude or longitude"))
+		lat, err := strconv.ParseFloat(latStr, 64)
+		if err != nil {
+			utils.RespondError(c, http.StatusBadRequest, fmt.Errorf("invalid latitude: %w", err))
+			return
+		}
+		lon, err := strconv.ParseFloat(lonStr, 64)
+		if err != nil {
+			utils.RespondError(c, http.StatusBadRequest, fmt.Errorf("invalid longitude: %w", err))
 			return
 		}
 
+		// Use Haversine-based sorting
 		pickups, err := h.pickupService.ListPendingPickupsNearby(c.Request.Context(), lat, lon)
 		if err != nil {
 			utils.RespondWithDomainError(c, err)
 			return
 		}
-		utils.RespondSuccess(c, http.StatusOK, "Nearby pending pickups retrieved (sorted by distance)", pickups)
+		utils.RespondSuccess(c, http.StatusOK, "Pending pickups near you", pickups)
 		return
 	}
 
-	// Default: return all without distance
+	// Otherwise, return all pending pickups without sorting
 	pickups, err := h.pickupService.ListPendingPickups(c.Request.Context())
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
 	}
-	utils.RespondSuccess(c, http.StatusOK, "Pending pickups retrieved", pickups)
+	utils.RespondSuccess(c, http.StatusOK, "All pending pickups", pickups)
 }
 
 // GetMyTasks godoc
@@ -116,7 +117,7 @@ func (h *PickupHandler) GetPendingPickups(c *gin.Context) {
 // Role: collector
 func (h *PickupHandler) GetMyTasks(c *gin.Context) {
 	collectorID := middleware.GetUserID(c)
-	pickups, err := h.pickupService.ListMyTasks(c.Request.Context(), collectorID)
+	pickups, err := h.pickupService.ListCollectorTasks(c.Request.Context(), collectorID)
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
@@ -131,17 +132,19 @@ func (h *PickupHandler) TakeTask(c *gin.Context) {
 	pickupID := c.Param("id")
 	collectorID := middleware.GetUserID(c)
 
-	pickup, err := h.pickupService.TakeTask(c.Request.Context(), pickupID, collectorID)
+	pickup, err := h.pickupService.TakePickup(c.Request.Context(), pickupID, collectorID)
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
 	}
-	utils.RespondSuccess(c, http.StatusOK, "Task taken successfully", pickup)
+
+	utils.RespondSuccess(c, http.StatusOK, "Pickup task taken successfully", pickup)
 }
 
 // CompleteTask godoc
 // POST /api/v1/collector/pickups/:id/complete
 // Role: collector
+// Body: { "items": [{"category_id": 1, "weight": 5.5}, ...] }
 func (h *PickupHandler) CompleteTask(c *gin.Context) {
 	pickupID := c.Param("id")
 	collectorID := middleware.GetUserID(c)
@@ -152,10 +155,15 @@ func (h *PickupHandler) CompleteTask(c *gin.Context) {
 		return
 	}
 
-	detail, err := h.pickupService.CompleteTask(c.Request.Context(), pickupID, collectorID, &req)
+	pickup, totalPoints, err := h.pickupService.CompletePickup(c.Request.Context(), pickupID, collectorID, req.Items)
 	if err != nil {
 		utils.RespondWithDomainError(c, err)
 		return
 	}
-	utils.RespondSuccess(c, http.StatusOK, "Pickup completed. Points awarded successfully", detail)
+
+	result := map[string]interface{}{
+		"pickup":       pickup,
+		"total_points": totalPoints,
+	}
+	utils.RespondSuccess(c, http.StatusOK, "Pickup completed and points awarded", result)
 }

@@ -16,4 +16,5 @@ var (
 	ErrPickupNotTaken     = errors.New("pickup has not been taken yet")
 	ErrPickupAlreadyTaken = errors.New("pickup has already been taken by a collector")
 	ErrInvalidRole        = errors.New("invalid role for this action")
+	ErrEmailAlreadyExists = errors.New("email is already registered")
 )

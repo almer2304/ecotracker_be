@@ -91,3 +91,64 @@ func (r *AuthRepository) EmailExists(ctx context.Context, email string) (bool, e
 	}
 	return exists, nil
 }
+
+// ListProfilesByRole returns all profiles with specific role
+func (r *AuthRepository) ListProfilesByRole(ctx context.Context, role string) ([]domain.Profile, error) {
+	query := `
+		SELECT id, name, email, COALESCE(phone,''), role, total_points,
+		       COALESCE(address_default,''), COALESCE(avatar_url,''),
+		       password_hash, created_at, updated_at
+		FROM profiles
+		WHERE role = $1
+		ORDER BY created_at DESC`
+
+	rows, err := r.db.Query(ctx, query, role)
+	if err != nil {
+		return nil, fmt.Errorf("list profiles by role: %w", err)
+	}
+	defer rows.Close()
+
+	var profiles []domain.Profile
+	for rows.Next() {
+		var p domain.Profile
+		if err := rows.Scan(
+			&p.ID, &p.Name, &p.Email, &p.Phone, &p.Role,
+			&p.TotalPoints, &p.AddressDefault, &p.AvatarURL,
+			&p.PasswordHash, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan profile: %w", err)
+		}
+		profiles = append(profiles, p)
+	}
+
+	return profiles, rows.Err()
+}
+
+// CountProfilesByRole counts profiles with specific role
+func (r *AuthRepository) CountProfilesByRole(ctx context.Context, role string) (int, error) {
+	var count int
+	err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM profiles WHERE role = $1`, role).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count profiles by role: %w", err)
+	}
+	return count, nil
+}
+
+// GetTotalPoints returns sum of all user points
+func (r *AuthRepository) GetTotalPoints(ctx context.Context) (int, error) {
+	var total int
+	err := r.db.QueryRow(ctx, `SELECT COALESCE(SUM(total_points), 0) FROM profiles`).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("get total points: %w", err)
+	}
+	return total, nil
+}
+
+// DeleteProfile deletes a profile
+func (r *AuthRepository) DeleteProfile(ctx context.Context, id string) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM profiles WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete profile: %w", err)
+	}
+	return nil
+}
