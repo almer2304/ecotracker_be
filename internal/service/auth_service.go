@@ -4,115 +4,110 @@ import (
 	"context"
 	"fmt"
 
-	"ecotracker/internal/domain"
-	"ecotracker/internal/repository"
-	"ecotracker/internal/utils"
-
-	"golang.org/x/crypto/bcrypt"
+	"github.com/ecotracker/backend/internal/domain"
+	"github.com/ecotracker/backend/internal/repository"
+	"github.com/ecotracker/backend/internal/utils"
 )
 
 type AuthService struct {
-	authRepo *repository.AuthRepository
-	jwtUtil  *utils.JWTUtil
+	authRepo   *repository.AuthRepository
+	jwtManager *utils.JWTManager
+	bcryptCost int
 }
 
-func NewAuthService(authRepo *repository.AuthRepository, jwtUtil *utils.JWTUtil) *AuthService {
-	return &AuthService{
-		authRepo: authRepo,
-		jwtUtil:  jwtUtil,
-	}
+func NewAuthService(authRepo *repository.AuthRepository, jwtManager *utils.JWTManager, bcryptCost int) *AuthService {
+	return &AuthService{authRepo: authRepo, jwtManager: jwtManager, bcryptCost: bcryptCost}
 }
 
-// Register creates a new user account
+// Register mendaftarkan user baru (role = user)
 func (s *AuthService) Register(ctx context.Context, req *domain.RegisterRequest) (*domain.AuthResponse, error) {
-	// Check if email already exists
-	exists, err := s.authRepo.EmailExists(ctx, req.Email)
-	if err != nil {
-		return nil, fmt.Errorf("check email: %w", err)
-	}
-	if exists {
+	return s.RegisterWithRole(ctx, req, domain.RoleUser)
+}
+
+// RegisterWithRole mendaftarkan akun dengan role tertentu (admin/collector/user)
+func (s *AuthService) RegisterWithRole(ctx context.Context, req *domain.RegisterRequest, role domain.UserRole) (*domain.AuthResponse, error) {
+	// Cek email sudah terdaftar
+	_, _, err := s.authRepo.GetByEmail(ctx, req.Email)
+	if err == nil {
 		return nil, domain.ErrEmailAlreadyExists
+	}
+	if err != domain.ErrInvalidCredentials {
+		return nil, fmt.Errorf("cek email: %w", err)
 	}
 
 	// Hash password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hash, err := utils.HashPassword(req.Password, s.bcryptCost)
 	if err != nil {
-		return nil, fmt.Errorf("hash password: %w", err)
+		return nil, err
 	}
 
-	// Create profile
-	profile := &domain.Profile{
-		Name:         req.Name,
-		Email:        req.Email,
-		Phone:        req.Phone,
-		Role:         req.Role,
-		PasswordHash: string(hashedPassword),
-	}
-
-	if err := s.authRepo.CreateProfile(ctx, profile); err != nil {
-		return nil, fmt.Errorf("create user: %w", err)
-	}
-
-	// Generate JWT token
-	token, err := s.jwtUtil.GenerateToken(profile.ID, profile.Email, profile.Role)
+	// Buat profil
+	profile, err := s.authRepo.Create(ctx, req.Name, req.Email, hash, req.Phone, role)
 	if err != nil {
-		return nil, fmt.Errorf("generate token: %w", err)
+		return nil, fmt.Errorf("buat profil: %w", err)
 	}
 
-	// Return response without password hash
-	profile.PasswordHash = ""
-
-	return &domain.AuthResponse{
-		Token:   token,
-		Profile: profile,
-	}, nil
+	return s.generateTokenResponse(ctx, profile)
 }
 
-// Login authenticates a user
-func (s *AuthService) Login(ctx context.Context, email, password string) (*domain.AuthResponse, error) {
-	fmt.Printf("[LOGIN DEBUG] Email: %s\n", email)
-	
-	// Get user by email
-	user, err := s.authRepo.GetProfileByEmail(ctx, email)
+// Login memverifikasi kredensial dan mengembalikan token
+func (s *AuthService) Login(ctx context.Context, req *domain.LoginRequest) (*domain.AuthResponse, error) {
+	profile, hash, err := s.authRepo.GetByEmail(ctx, req.Email)
 	if err != nil {
-		fmt.Printf("[LOGIN ERROR] User not found: %v\n", err)
 		return nil, domain.ErrInvalidCredentials
 	}
-	
-	fmt.Printf("[LOGIN DEBUG] User found: %s (ID: %s)\n", user.Email, user.ID)
-	
-	// Verify password
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		fmt.Printf("[LOGIN ERROR] Password mismatch: %v\n", err)
+
+	if !utils.CheckPassword(req.Password, hash) {
 		return nil, domain.ErrInvalidCredentials
 	}
-	
-	fmt.Printf("[LOGIN SUCCESS] Password verified!\n")
-	
-	// Generate token
-	token, err := s.jwtUtil.GenerateToken(user.ID, user.Email, user.Role)
-	if err != nil {
-		return nil, fmt.Errorf("generate token: %w", err)
-	}
-	
-	// Return response without password hash
-	user.PasswordHash = ""
-	
-	return &domain.AuthResponse{
-		Token:   token,
-		Profile: user,
-	}, nil
+
+	return s.generateTokenResponse(ctx, profile)
 }
 
-// GetProfile fetches user profile by ID
+// RefreshToken menghasilkan access token baru dari refresh token
+func (s *AuthService) RefreshToken(ctx context.Context, refreshToken string) (*domain.AuthResponse, error) {
+	// Validasi refresh token
+	claims, err := s.jwtManager.ValidateToken(refreshToken)
+	if err != nil {
+		return nil, domain.ErrInvalidToken
+	}
+
+	// Cek di database (pastikan belum di-revoke)
+	profile, err := s.authRepo.GetByRefreshToken(ctx, refreshToken)
+	if err != nil || profile.ID != claims.UserID {
+		return nil, domain.ErrInvalidToken
+	}
+
+	return s.generateTokenResponse(ctx, profile)
+}
+
+// GetProfile mengambil profil user berdasarkan ID
 func (s *AuthService) GetProfile(ctx context.Context, userID string) (*domain.Profile, error) {
-	profile, err := s.authRepo.GetProfileByID(ctx, userID)
+	return s.authRepo.GetByID(ctx, userID)
+}
+
+func (s *AuthService) generateTokenResponse(ctx context.Context, profile *domain.Profile) (*domain.AuthResponse, error) {
+	// Generate access token
+	accessToken, _, err := s.jwtManager.GenerateAccessToken(profile.ID, profile.Email, string(profile.Role))
 	if err != nil {
-		return nil, fmt.Errorf("get profile: %w", err)
+		return nil, err
 	}
-	
-	// Don't return password hash
-	profile.PasswordHash = ""
-	
-	return profile, nil
+
+	// Generate refresh token
+	refreshToken, refreshExpires, err := s.jwtManager.GenerateRefreshToken(profile.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Simpan refresh token
+	if err := s.authRepo.SaveRefreshToken(ctx, profile.ID, refreshToken, refreshExpires); err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    s.jwtManager.AccessTokenExpirySeconds(),
+		User:         profile,
+	}, nil
 }

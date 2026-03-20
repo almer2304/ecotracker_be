@@ -1,45 +1,37 @@
 package config
 
 import (
-	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 )
 
-func NewDBPool(dbURL string) (*pgxpool.Pool, error) {
-	// Parse config
-	config, err := pgxpool.ParseConfig(dbURL)
+// NewDatabase membuat koneksi database PostgreSQL dengan connection pooling
+func NewDatabase(cfg *DBConfig) (*sql.DB, error) {
+	db, err := sql.Open("postgres", cfg.DSN())
 	if err != nil {
-		return nil, fmt.Errorf("parse db config: %w", err)
+		return nil, fmt.Errorf("gagal membuka koneksi database: %w", err)
 	}
 
-	// Configure connection pool
-	config.MaxConns = 10
-	config.MinConns = 2
-	config.MaxConnLifetime = time.Hour
-	config.MaxConnIdleTime = 30 * time.Minute
-	config.HealthCheckPeriod = 1 * time.Minute
+	// Connection pooling
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 
-	// ✅ FIX: Use simple protocol to avoid prepared statement cache
-	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-
-	// Create pool
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		return nil, fmt.Errorf("create connection pool: %w", err)
+	// Cek koneksi
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("gagal ping database: %w", err)
 	}
 
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	logrus.WithFields(logrus.Fields{
+		"host":          cfg.Host,
+		"database":      cfg.Name,
+		"max_open_conn": cfg.MaxOpenConns,
+	}).Info("Database terhubung")
 
-	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("ping database: %w", err)
-	}
-
-	fmt.Println("✓ Database connected successfully")
-	return pool, nil
+	return db, nil
 }

@@ -3,308 +3,111 @@ package service
 import (
 	"context"
 	"fmt"
-	"io"
 	"mime/multipart"
-	"path/filepath"
-	"strings"
-	"time"
 
-	"ecotracker/internal/domain"
-	"ecotracker/internal/repository"
-	"ecotracker/internal/utils"
-
-	"github.com/google/uuid"
+	"github.com/ecotracker/backend/internal/domain"
+	"github.com/ecotracker/backend/internal/repository"
+	"github.com/ecotracker/backend/internal/utils"
 )
 
+// PickupService mengelola logika bisnis untuk pickup request
 type PickupService struct {
-	pickupRepo *repository.PickupRepository
-	storage    *utils.StorageClient
-	bucket     string
+	pickupRepo        *repository.PickupRepository
+	assignmentService *AssignmentService
+	storageClient     *utils.StorageClient
 }
 
-func NewPickupService(pickupRepo *repository.PickupRepository, storage *utils.StorageClient, bucket string) *PickupService {
+func NewPickupService(
+	pickupRepo *repository.PickupRepository,
+	assignmentService *AssignmentService,
+	storageClient *utils.StorageClient,
+) *PickupService {
 	return &PickupService{
-		pickupRepo: pickupRepo,
-		storage:    storage,
-		bucket:     bucket,
+		pickupRepo:        pickupRepo,
+		assignmentService: assignmentService,
+		storageClient:     storageClient,
 	}
 }
 
-// CreatePickup - FIXED VERSION with direct upload (no image processing)
+// CreatePickup membuat pickup baru, upload foto, lalu auto-assign collector terdekat
 func (s *PickupService) CreatePickup(
 	ctx context.Context,
 	userID string,
 	req *domain.CreatePickupRequest,
-	fileHeader *multipart.FileHeader,
+	photoFile multipart.File,
+	photoHeader *multipart.FileHeader,
 ) (*domain.Pickup, error) {
-	var photoURL string
+	var photoURL *string
 
-	// Photo upload - SIMPLIFIED (no processing)
-	if fileHeader != nil {
-		fmt.Printf("[DEBUG] Processing photo: %s, size: %d bytes\n", fileHeader.Filename, fileHeader.Size)
-		
-		// Open file
-		file, err := fileHeader.Open()
+	// Upload foto jika ada
+	if photoFile != nil && photoHeader != nil {
+		if s.storageClient == nil {
+			return nil, fmt.Errorf("storage belum dikonfigurasi, cek SUPABASE_URL dan SUPABASE_KEY di .env")
+		}
+		url, err := s.storageClient.UploadPickupPhoto(ctx, photoFile, photoHeader)
 		if err != nil {
-			fmt.Printf("[ERROR] Failed to open file: %v\n", err)
-			return nil, fmt.Errorf("open file: %w", err)
+			return nil, fmt.Errorf("upload foto: %w", err)
 		}
-		defer file.Close()
-
-		// Read all bytes
-		imgBytes, err := io.ReadAll(file)
-		if err != nil {
-			fmt.Printf("[ERROR] Failed to read file: %v\n", err)
-			return nil, fmt.Errorf("read file: %w", err)
-		}
-		fmt.Printf("[DEBUG] File read successfully: %d bytes\n", len(imgBytes))
-
-		// Generate unique filename
-		ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-		if ext == "" {
-			ext = ".jpg"
-		}
-		filename := fmt.Sprintf("%s-%d%s", uuid.New().String(), time.Now().Unix(), ext)
-		filePath := fmt.Sprintf("pickups/%s", filename)
-
-		// Determine content type
-		contentType := fileHeader.Header.Get("Content-Type")
-		if contentType == "" {
-			// Guess from extension
-			switch ext {
-			case ".jpg", ".jpeg":
-				contentType = "image/jpeg"
-			case ".png":
-				contentType = "image/png"
-			case ".webp":
-				contentType = "image/webp"
-			default:
-				contentType = "image/jpeg"
-			}
-		}
-		fmt.Printf("[DEBUG] Uploading to Supabase: %s (type: %s)\n", filePath, contentType)
-
-		// Upload to Supabase Storage
-		photoURL, err = s.storage.UploadImage(s.bucket, filePath, imgBytes, contentType)
-		if err != nil {
-			fmt.Printf("[ERROR] Upload failed: %v\n", err)
-			return nil, fmt.Errorf("upload photo to storage: %w", err)
-		}
-		fmt.Printf("[SUCCESS] Photo uploaded: %s\n", photoURL)
+		photoURL = &url
 	}
 
-	// Create pickup record
-	pickup := &domain.Pickup{
-		UserID:    userID,
-		Address:   req.Address,
-		Latitude:  req.Latitude,
-		Longitude: req.Longitude,
-		PhotoURL:  photoURL,
-		Notes:     req.Notes,
+	var notesPtr *string
+	if req.Notes != "" {
+		notesPtr = &req.Notes
 	}
 
-	fmt.Printf("[DEBUG] Creating pickup record in database...\n")
-	if err := s.pickupRepo.Create(ctx, pickup); err != nil {
-		fmt.Printf("[ERROR] Database insert failed: %v\n", err)
-		return nil, fmt.Errorf("save pickup to database: %w", err)
-	}
-	
-	fmt.Printf("[SUCCESS] Pickup created with ID: %s\n", pickup.ID)
-	return pickup, nil
-}
-
-// GetPickupDetail returns pickup with its items
-func (s *PickupService) GetPickupDetail(ctx context.Context, pickupID string) (*domain.PickupDetail, error) {
-	pickup, err := s.pickupRepo.GetByID(ctx, pickupID)
+	// Simpan pickup ke database
+	pickup, err := s.pickupRepo.Create(ctx, userID, req.Address, req.Lat, req.Lon, photoURL, notesPtr)
 	if err != nil {
-		return nil, fmt.Errorf("get pickup: %w", err)
+		return nil, fmt.Errorf("buat pickup: %w", err)
 	}
 
-	items, err := s.pickupRepo.GetItemsByPickupID(ctx, pickupID)
-	if err != nil {
-		return nil, fmt.Errorf("get items: %w", err)
-	}
-
-	detail := &domain.PickupDetail{
-		Pickup: *pickup,
-		Items:  items,
-	}
-	return detail, nil
-}
-
-// ListMyPickups returns all pickups created by the user
-func (s *PickupService) ListMyPickups(ctx context.Context, userID string) ([]domain.Pickup, error) {
-	pickups, err := s.pickupRepo.ListByUserID(ctx, userID)
-	if err != nil {
-		return nil, fmt.Errorf("list my pickups: %w", err)
-	}
-	return pickups, nil
-}
-
-// ListPendingPickups returns all pending pickups (for collectors)
-func (s *PickupService) ListPendingPickups(ctx context.Context) ([]domain.Pickup, error) {
-	pickups, err := s.pickupRepo.ListByStatus(ctx, "pending")
-	if err != nil {
-		return nil, fmt.Errorf("list pending pickups: %w", err)
-	}
-	return pickups, nil
-}
-
-// ListPendingPickupsNearby returns pending pickups sorted by distance from collector's location
-func (s *PickupService) ListPendingPickupsNearby(ctx context.Context, lat, lon float64) ([]domain.PickupWithDistance, error) {
-	// Get all pending pickups
-	pickups, err := s.pickupRepo.ListByStatus(ctx, "pending")
-	if err != nil {
-		return nil, fmt.Errorf("list pending pickups: %w", err)
-	}
-
-	// Calculate distances and create result
-	results := make([]domain.PickupWithDistance, 0)
-	for _, p := range pickups {
-		// Skip invalid coordinates (0,0)
-		if p.Latitude == 0 && p.Longitude == 0 {
-			continue
+	// Auto-assign collector terdekat (async, tidak blokir response)
+	go func() {
+		bgCtx := context.Background()
+		if err := s.assignmentService.AssignClosestCollector(bgCtx, pickup.ID, pickup.Lat, pickup.Lon, nil); err != nil {
+			// Log error tapi tidak gagalkan request - pickup tetap tersimpan dengan status pending
+			_ = err
 		}
-
-		// Calculate distance using Haversine formula
-		distance := utils.CalculateDistance(lat, lon, p.Latitude, p.Longitude)
-
-		result := domain.PickupWithDistance{
-			ID:          p.ID,
-			UserID:      p.UserID,
-			CollectorID: p.CollectorID,
-			Status:      p.Status,
-			Address:     p.Address,
-			Latitude:    p.Latitude,
-			Longitude:   p.Longitude,
-			PhotoURL:    p.PhotoURL,
-			Notes:       p.Notes,
-			CompletedAt: p.CompletedAt,
-			CreatedAt:   p.CreatedAt,
-			DistanceKm:  distance,
-		}
-		results = append(results, result)
-	}
-
-	// Sort by distance (bubble sort for simplicity)
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[i].DistanceKm > results[j].DistanceKm {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-
-	return results, nil
-}
-
-// ListPendingPickupsNearbyPostGIS uses PostGIS for distance calculation (faster for large datasets)
-func (s *PickupService) ListPendingPickupsNearbyPostGIS(ctx context.Context, lat, lon float64) ([]domain.PickupWithDistance, error) {
-	pickups, err := s.pickupRepo.ListByStatusNearLocation(ctx, "pending", lat, lon, 50)
-	if err != nil {
-		return nil, fmt.Errorf("list pending pickups near location (PostGIS): %w", err)
-	}
-	return pickups, nil
-}
-
-// TakePickup allows collector to take a pending pickup
-func (s *PickupService) TakePickup(ctx context.Context, pickupID, collectorID string) (*domain.Pickup, error) {
-	// Use repository's TakeTask method
-	if err := s.pickupRepo.TakeTask(ctx, pickupID, collectorID); err != nil {
-		return nil, fmt.Errorf("take pickup: %w", err)
-	}
-
-	// Get updated pickup
-	pickup, err := s.pickupRepo.GetByID(ctx, pickupID)
-	if err != nil {
-		return nil, fmt.Errorf("get pickup: %w", err)
-	}
+	}()
 
 	return pickup, nil
 }
 
-// CompletePickup marks pickup as completed and awards points
-func (s *PickupService) CompletePickup(
-	ctx context.Context,
-	pickupID, collectorID string,
-	items []domain.PickupItemInput,
-) (*domain.Pickup, int, error) {
-	fmt.Printf("[COMPLETE] Starting completion for pickup: %s by collector: %s\n", pickupID, collectorID)
-	fmt.Printf("[COMPLETE] Items: %+v\n", items)
-	
-	// Get pickup first to get userID
-	pickup, err := s.pickupRepo.GetByID(ctx, pickupID)
-	if err != nil {
-		fmt.Printf("[COMPLETE ERROR] Get pickup failed: %v\n", err)
-		return nil, 0, fmt.Errorf("get pickup: %w", err)
-	}
-
-	fmt.Printf("[COMPLETE] Pickup found: %+v\n", pickup)
-
-	// Validate ownership
-	if pickup.CollectorID != collectorID {
-		fmt.Printf("[COMPLETE ERROR] Collector mismatch. Expected: %s, Got: %s\n", pickup.CollectorID, collectorID)
-		return nil, 0, fmt.Errorf("pickup not assigned to this collector")
-	}
-
-	// Validate status
-	if pickup.Status != "taken" {
-		fmt.Printf("[COMPLETE ERROR] Invalid status: %s (expected: taken)\n", pickup.Status)
-		return nil, 0, fmt.Errorf("pickup is not taken (current status: %s)", pickup.Status)
-	}
-
-	// Convert input items to domain.PickupItem and calculate points
-	totalPoints := 0
-	pickupItems := make([]domain.PickupItem, 0, len(items))
-	
-	for i, item := range items {
-		fmt.Printf("[COMPLETE] Processing item %d: category_id=%d, weight=%.2f\n", i+1, item.CategoryID, item.Weight)
-		
-		// Validate weight
-		if item.Weight <= 0 {
-			fmt.Printf("[COMPLETE ERROR] Invalid weight for item %d: %.2f\n", i+1, item.Weight)
-			return nil, 0, fmt.Errorf("item %d: weight must be greater than 0", i+1)
-		}
-		
-		// Calculate points: weight * 10 (simplified)
-		subtotalPoints := int(item.Weight * 10)
-		totalPoints += subtotalPoints
-
-		pickupItems = append(pickupItems, domain.PickupItem{
-			PickupID:       pickupID,
-			CategoryID:     item.CategoryID,
-			Weight:         item.Weight,
-			SubtotalPoints: subtotalPoints,
-		})
-	}
-
-	fmt.Printf("[COMPLETE] Total points calculated: %d\n", totalPoints)
-
-	// Use repository's atomic transaction to complete pickup
-	fmt.Printf("[COMPLETE] Calling CompletePickupTx...\n")
-	if err := s.pickupRepo.CompletePickupTx(ctx, pickupID, collectorID, pickupItems, totalPoints, pickup.UserID); err != nil {
-		fmt.Printf("[COMPLETE ERROR] Transaction failed: %v\n", err)
-		return nil, 0, fmt.Errorf("complete pickup transaction: %w", err)
-	}
-
-	fmt.Printf("[COMPLETE] Transaction successful!\n")
-
-	// Get updated pickup
-	pickup, err = s.pickupRepo.GetByID(ctx, pickupID)
-	if err != nil {
-		fmt.Printf("[COMPLETE ERROR] Get updated pickup failed: %v\n", err)
-		return nil, 0, fmt.Errorf("get updated pickup: %w", err)
-	}
-
-	fmt.Printf("[COMPLETE SUCCESS] Pickup %s completed with %d points\n", pickupID, totalPoints)
-	return pickup, totalPoints, nil
+// GetMyPickups mengambil daftar pickup milik user dengan pagination
+func (s *PickupService) GetMyPickups(ctx context.Context, userID string, page, limit int) ([]*domain.Pickup, int, error) {
+	offset := (page - 1) * limit
+	return s.pickupRepo.ListByUserID(ctx, userID, limit, offset)
 }
 
-// ListCollectorTasks returns all pickups assigned to a collector
-func (s *PickupService) ListCollectorTasks(ctx context.Context, collectorID string) ([]domain.Pickup, error) {
-	pickups, err := s.pickupRepo.ListByCollectorID(ctx, collectorID)
+// GetPickupDetail mengambil detail pickup (validasi kepemilikan)
+func (s *PickupService) GetPickupDetail(ctx context.Context, pickupID, userID string, role domain.UserRole) (*domain.Pickup, error) {
+	pickup, err := s.pickupRepo.GetByID(ctx, pickupID)
 	if err != nil {
-		return nil, fmt.Errorf("list collector tasks: %w", err)
+		return nil, err
 	}
-	return pickups, nil
+
+	// Validasi akses: user hanya bisa lihat pickup milik sendiri
+	// Collector hanya bisa lihat pickup yang ditugaskan kepadanya
+	// Admin bisa lihat semua
+	switch role {
+	case domain.RoleUser:
+		if pickup.UserID != userID {
+			return nil, domain.ErrForbidden
+		}
+	case domain.RoleCollector:
+		if pickup.CollectorID == nil || *pickup.CollectorID != userID {
+			return nil, domain.ErrForbidden
+		}
+	}
+
+	// Ambil juga item-item pickup jika sudah completed
+	if pickup.Status == domain.StatusCompleted {
+		items, err := s.pickupRepo.GetPickupItems(ctx, pickupID)
+		if err == nil {
+			pickup.Items = items
+		}
+	}
+
+	return pickup, nil
 }

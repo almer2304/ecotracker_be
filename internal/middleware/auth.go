@@ -4,99 +4,94 @@ import (
 	"net/http"
 	"strings"
 
-	"ecotracker/internal/utils"
-
+	"github.com/ecotracker/backend/internal/domain"
+	"github.com/ecotracker/backend/internal/utils"
 	"github.com/gin-gonic/gin"
 )
 
 const (
-	ContextUserID = "userID"
-	ContextEmail  = "userEmail"
-	ContextRole   = "userRole"
+	ContextUserID = "user_id"
+	ContextEmail  = "user_email"
+	ContextRole   = "user_role"
 )
 
-func AuthMiddleware(jwtUtil *utils.JWTUtil) gin.HandlerFunc {
+// AuthMiddleware memvalidasi JWT token dan menyimpan info user ke context
+func AuthMiddleware(jwtManager *utils.JWTManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			c.JSON(http.StatusUnauthorized, gin.H{
 				"success": false,
-				"error":   "Authorization header is required",
+				"error":   "Token autentikasi diperlukan",
 			})
+			c.Abort()
 			return
 		}
 
+		// Format: "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			c.JSON(http.StatusUnauthorized, gin.H{
 				"success": false,
-				"error":   "Invalid authorization format. Use: Bearer <token>",
+				"error":   "Format token tidak valid, gunakan: Bearer <token>",
 			})
+			c.Abort()
 			return
 		}
 
-		claims, err := jwtUtil.ValidateToken(parts[1])
+		claims, err := jwtManager.ValidateToken(parts[1])
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			c.JSON(http.StatusUnauthorized, gin.H{
 				"success": false,
-				"error":   "Invalid or expired token",
+				"error":   "Token tidak valid atau sudah kadaluarsa",
 			})
+			c.Abort()
 			return
 		}
 
-		// Set user info in context
+		// Simpan info user ke context
 		c.Set(ContextUserID, claims.UserID)
 		c.Set(ContextEmail, claims.Email)
 		c.Set(ContextRole, claims.Role)
+
 		c.Next()
 	}
 }
 
-// RequireRole restricts endpoint to specific roles
-func RequireRole(roles ...string) gin.HandlerFunc {
+// RequireRole middleware untuk membatasi akses berdasarkan role
+func RequireRole(roles ...domain.UserRole) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userRole, exists := c.Get(ContextRole)
+		roleStr, exists := c.Get(ContextRole)
 		if !exists {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"success": false,
-				"error":   "No role found in context",
-			})
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "Tidak terautentikasi"})
+			c.Abort()
 			return
 		}
 
-		role, ok := userRole.(string)
-		if !ok {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-				"success": false,
-				"error":   "Invalid role type in context",
-			})
-			return
-		}
-
-		for _, allowed := range roles {
-			if role == allowed {
+		userRole := domain.UserRole(roleStr.(string))
+		for _, allowedRole := range roles {
+			if userRole == allowedRole {
 				c.Next()
 				return
 			}
 		}
 
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
-			"error":   "Forbidden: insufficient permissions",
+			"error":   "Akses ditolak: role tidak memiliki izin untuk endpoint ini",
 		})
+		c.Abort()
 	}
 }
 
-// GetUserID is a helper to extract userID from Gin context
+// GetUserID helper untuk mengambil user ID dari context
 func GetUserID(c *gin.Context) string {
 	id, _ := c.Get(ContextUserID)
-	str, _ := id.(string)
-	return str
+	return id.(string)
 }
 
-// GetUserRole is a helper to extract role from Gin context
-func GetUserRole(c *gin.Context) string {
+// GetUserRole helper untuk mengambil role dari context
+func GetUserRole(c *gin.Context) domain.UserRole {
 	role, _ := c.Get(ContextRole)
-	str, _ := role.(string)
-	return str
+	return domain.UserRole(role.(string))
 }

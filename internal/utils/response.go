@@ -1,61 +1,92 @@
 package utils
 
 import (
-	"errors"
+	"math"
 	"net/http"
 
-	"ecotracker/internal/domain"
-
+	"github.com/ecotracker/backend/internal/domain"
 	"github.com/gin-gonic/gin"
 )
 
-type Response struct {
+// APIResponse format response standar
+type APIResponse struct {
 	Success bool        `json:"success"`
 	Message string      `json:"message,omitempty"`
 	Data    interface{} `json:"data,omitempty"`
 	Error   string      `json:"error,omitempty"`
 }
 
-func RespondSuccess(c *gin.Context, statusCode int, message string, data interface{}) {
-	c.JSON(statusCode, Response{
+// Success mengirimkan response sukses
+func Success(c *gin.Context, code int, message string, data interface{}) {
+	c.JSON(code, APIResponse{
 		Success: true,
 		Message: message,
 		Data:    data,
 	})
 }
 
-func RespondError(c *gin.Context, statusCode int, err error) {
-	c.JSON(statusCode, Response{
+// Error mengirimkan response error
+func Error(c *gin.Context, code int, message string) {
+	c.JSON(code, APIResponse{
 		Success: false,
-		Error:   err.Error(),
+		Error:   message,
 	})
 }
 
-func RespondWithDomainError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, domain.ErrNotFound):
-		RespondError(c, http.StatusNotFound, err)
-	case errors.Is(err, domain.ErrUnauthorized):
-		RespondError(c, http.StatusUnauthorized, err)
-	case errors.Is(err, domain.ErrForbidden):
-		RespondError(c, http.StatusForbidden, err)
-	case errors.Is(err, domain.ErrConflict):
-		RespondError(c, http.StatusConflict, err)
-	case errors.Is(err, domain.ErrInvalidCredentials):
-		RespondError(c, http.StatusUnauthorized, err)
-	case errors.Is(err, domain.ErrInsufficientPoints):
-		RespondError(c, http.StatusBadRequest, err)
-	case errors.Is(err, domain.ErrVoucherOutOfStock):
-		RespondError(c, http.StatusBadRequest, err)
-	case errors.Is(err, domain.ErrVoucherInactive):
-		RespondError(c, http.StatusBadRequest, err)
-	case errors.Is(err, domain.ErrPickupNotPending):
-		RespondError(c, http.StatusBadRequest, err)
-	case errors.Is(err, domain.ErrPickupNotTaken):
-		RespondError(c, http.StatusBadRequest, err)
-	case errors.Is(err, domain.ErrPickupAlreadyTaken):
-		RespondError(c, http.StatusConflict, err)
+// HandleError menangani error domain dan menghasilkan response yang sesuai
+func HandleError(c *gin.Context, err error) {
+	// Cek apakah AppError
+	if appErr, ok := err.(*domain.AppError); ok {
+		Error(c, appErr.Code, appErr.Message)
+		return
+	}
+
+	// Map domain errors ke HTTP status
+	switch err {
+	case domain.ErrEmailAlreadyExists:
+		Error(c, http.StatusConflict, err.Error())
+	case domain.ErrInvalidCredentials:
+		Error(c, http.StatusUnauthorized, err.Error())
+	case domain.ErrInvalidToken, domain.ErrTokenExpired:
+		Error(c, http.StatusUnauthorized, err.Error())
+	case domain.ErrUnauthorized:
+		Error(c, http.StatusUnauthorized, err.Error())
+	case domain.ErrForbidden:
+		Error(c, http.StatusForbidden, err.Error())
+	case domain.ErrNotFound,
+		domain.ErrPickupNotFound,
+		domain.ErrCollectorNotFound,
+		domain.ErrBadgeNotFound,
+		domain.ErrReportNotFound,
+		domain.ErrFeedbackNotFound,
+		domain.ErrCategoryNotFound:
+		Error(c, http.StatusNotFound, err.Error())
+	case domain.ErrNoCollectorAvailable:
+		Error(c, http.StatusServiceUnavailable, err.Error())
+	case domain.ErrPickupAlreadyAssigned,
+		domain.ErrCollectorBusy,
+		domain.ErrInvalidPickupStatus,
+		domain.ErrBadgeAlreadyAwarded:
+		Error(c, http.StatusConflict, err.Error())
+	case domain.ErrCollectorOffline:
+		Error(c, http.StatusBadRequest, err.Error())
+	case domain.ErrInvalidInput,
+		domain.ErrFileTooLarge,
+		domain.ErrInvalidFileType:
+		Error(c, http.StatusBadRequest, err.Error())
 	default:
-		RespondError(c, http.StatusInternalServerError, err)
+		Error(c, http.StatusInternalServerError, "Terjadi kesalahan internal, coba lagi nanti")
+	}
+}
+
+// BuildListResponse membuat response list dengan pagination
+func BuildListResponse(data interface{}, total, page, limit int) domain.ListResponse {
+	totalPages := int(math.Ceil(float64(total) / float64(limit)))
+	return domain.ListResponse{
+		Data:       data,
+		Total:      total,
+		Page:       page,
+		Limit:      limit,
+		TotalPages: totalPages,
 	}
 }
