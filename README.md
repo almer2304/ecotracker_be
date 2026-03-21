@@ -1,165 +1,247 @@
-# 🌱 EcoTracker API
+# 🌿 EcoTracker V2.0 — Backend API
 
-Platform Pengelolaan Sampah Berbasis Poin — Backend API dibangun dengan **Golang**, **Gin Gonic**, dan **Supabase (PostgreSQL)**.
+> Platform manajemen pengambilan sampah daur ulang yang menghubungkan user dengan collector terdekat secara otomatis.
+
+**Stack:** Go 1.21 · Gin · PostgreSQL (Supabase) · Redis (opsional) · JWT Auth
 
 ---
 
-## 🏗️ Arsitektur & Struktur Folder
+## 📋 Daftar Isi
+
+- [Overview](#overview)
+- [Cara Setup](#cara-setup)
+- [Environment Variables](#environment-variables)
+- [Struktur Project](#struktur-project)
+- [API Endpoints](#api-endpoints)
+  - [Auth](#auth)
+  - [Categories](#categories)
+  - [Pickups (User)](#pickups-user)
+  - [Collector](#collector)
+  - [Badges](#badges)
+  - [Reports](#reports)
+  - [Feedback](#feedback)
+  - [Admin](#admin)
+- [Sistem Poin & Badge](#sistem-poin--badge)
+- [Alur Auto-Assignment](#alur-auto-assignment)
+- [Error Codes](#error-codes)
+
+---
+
+## Overview
+
+### Aktor & Role
+
+| Role | Deskripsi |
+|------|-----------|
+| `user` | Membuat pickup request, kumpulkan poin & badge, lapor area kotor |
+| `collector` | Terima assignment pickup, update lokasi GPS, selesaikan pickup |
+| `admin` | Kelola collector, pantau semua aktivitas, balas feedback |
+
+### Autentikasi
+
+Semua endpoint (kecuali **Public**) membutuhkan JWT Bearer Token:
+
+```
+Authorization: Bearer <access_token>
+```
+
+| Token | Durasi | Keterangan |
+|-------|--------|------------|
+| Access Token | 15 menit | Untuk akses endpoint |
+| Refresh Token | 7 hari | Untuk generate access token baru |
+
+---
+
+## Cara Setup
+
+### 1. Clone & Install Dependencies
+```bash
+git clone <repo-url>
+cd ecotracker
+go mod tidy
+```
+
+### 2. Konfigurasi Environment
+```bash
+cp .env.example .env
+# Edit .env dan isi semua nilai yang diperlukan
+```
+
+### 3. Setup Database
+Buka **Supabase Dashboard → SQL Editor**, lalu jalankan berurutan:
+```
+migrations/001_schema.sql   ← buat semua tabel, index, view, seed data
+```
+
+### 4. Buat Bucket Supabase Storage
+Buat 3 bucket di **Supabase Dashboard → Storage** (set sebagai Public):
+- `waste-photos`
+- `report-photos`
+- `avatars`
+
+### 5. Jalankan Server
+```bash
+go run cmd/server/main.go
+```
+
+### 6. Verifikasi
+```bash
+curl http://localhost:8080/health
+# Response: {"status":"ok","service":"EcoTracker V2.0"}
+```
+
+---
+
+## Environment Variables
+
+```env
+# Server
+APP_ENV=development
+APP_PORT=8080
+
+# Database (Supabase)
+DB_HOST=db.xxx.supabase.co
+DB_PORT=6543
+DB_USER=postgres.xxx
+DB_PASSWORD=your_password
+DB_NAME=postgres
+DB_SSL_MODE=require
+DB_MAX_OPEN_CONNS=25
+DB_MAX_IDLE_CONNS=5
+
+# JWT
+JWT_SECRET=min-32-karakter-secret-key-disini
+JWT_ACCESS_EXPIRY=15m
+JWT_REFRESH_EXPIRY=168h
+
+# Supabase Storage
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_KEY=eyJhbGci...service_role_key
+SUPABASE_BUCKET_PICKUPS=waste-photos
+SUPABASE_BUCKET_REPORTS=report-photos
+SUPABASE_BUCKET_AVATARS=avatars
+
+# Admin Secret (untuk buat akun admin/collector via endpoint)
+ADMIN_SECRET=ecotracker-admin-secret-2026
+
+# Worker
+ASSIGNMENT_TIMEOUT=15m
+TIMEOUT_CHECK_INTERVAL=60s
+
+# Bcrypt
+BCRYPT_COST=12
+
+# Redis (opsional, untuk rate limiting)
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+```
+
+---
+
+## Struktur Project
 
 ```
 ecotracker/
-├── main.go                          # Entry point
-├── .env                             # Environment variables
-├── go.mod                           # Go module dependencies
+├── cmd/server/
+│   └── main.go                  ← Entry point, routing, DI
+├── internal/
+│   ├── config/
+│   │   ├── config.go            ← Load env vars
+│   │   ├── database.go          ← Connection pool
+│   │   └── redis.go             ← Redis client
+│   ├── domain/
+│   │   ├── models.go            ← Semua struct & DTOs
+│   │   └── errors.go            ← Domain errors
+│   ├── handler/                 ← HTTP layer (Gin handlers)
+│   ├── service/                 ← Business logic
+│   ├── repository/              ← Database access
+│   ├── middleware/              ← Auth, RateLimit, CORS, Logger
+│   ├── worker/                  ← Background jobs
+│   └── utils/                   ← JWT, bcrypt, Haversine, storage
 ├── migrations/
-│   └── 001_init.sql                 # Database schema & seed data
-├── cmd/
-│   └── server/
-│       └── server.go                # Router & dependency injection
-└── internal/
-    ├── config/
-    │   ├── config.go                # Load env variables
-    │   └── database.go              # pgxpool connection
-    ├── domain/
-    │   ├── models.go                # All structs/entities
-    │   └── errors.go                # Sentinel errors
-    ├── repository/
-    │   ├── auth_repository.go       # Profile DB operations
-    │   ├── pickup_repository.go     # Pickup + atomic TX
-    │   ├── waste_category_repository.go
-    │   ├── point_log_repository.go
-    │   └── voucher_repository.go    # Voucher + claim TX
-    ├── service/
-    │   ├── auth_service.go          # Business logic: register/login
-    │   ├── pickup_service.go        # Business logic: pickup lifecycle
-    │   ├── voucher_service.go       # Business logic: voucher claim
-    │   └── misc_services.go         # PointLog & WasteCategory services
-    ├── handler/
-    │   ├── auth_handler.go          # HTTP handlers: auth
-    │   ├── pickup_handler.go        # HTTP handlers: pickup
-    │   ├── voucher_handler.go       # HTTP handlers: voucher
-    │   └── misc_handler.go          # HTTP handlers: categories & points
-    ├── middleware/
-    │   └── auth.go                  # JWT auth + role guard middleware
-    └── utils/
-        ├── jwt.go                   # Token generate/validate
-        ├── response.go              # Consistent JSON response
-        ├── image.go                 # Image processing (WebP/JPG/PNG)
-        └── storage.go               # Supabase Storage upload client
+│   └── 001_schema.sql           ← Schema lengkap PostgreSQL
+├── .env.example
+└── go.mod
 ```
 
 ---
 
-## ⚙️ Setup & Menjalankan
+## API Endpoints
 
-### 1. Prasyarat
-- Go 1.22+
-- Akun Supabase (sudah dibuat)
+**Base URL:** `http://localhost:8080/api/v1`
 
-### 2. Setup Database
-Buka **Supabase SQL Editor** dan jalankan isi file `migrations/001_init.sql`. File ini akan membuat semua tabel dan mengisi data awal (kategori sampah & voucher).
+### Ringkasan
 
-### 3. Konfigurasi Environment
-File `.env` sudah tersedia. Pastikan nilainya sesuai:
-```env
-PORT=8080
-DB_URL=postgres://...
-SUPABASE_URL=https://...supabase.co
-SUPABASE_SERVICE_ROLE_KEY=eyJ...
-JWT_SECRET=ecotracker-super-secret-jwt-key-2026
-STORAGE_BUCKET=pickups
-```
-
-### 4. Setup Supabase Storage
-Di dashboard Supabase, buat bucket bernama **`pickups`** dan set sebagai **Public bucket**.
-
-### 5. Install Dependencies & Run
-```bash
-go mod tidy
-go run main.go
-```
-
-Server akan berjalan di `http://localhost:8080`
-
----
-
-## 🔐 Autentikasi
-
-Semua endpoint yang dilindungi membutuhkan header:
-```
-Authorization: Bearer <token_jwt>
-```
-
-Token diperoleh dari endpoint `/auth/login` atau `/auth/register`.
-
-### Peran (Role)
-| Role        | Aksi yang Diizinkan                                 |
-|-------------|-----------------------------------------------------|
-| `user`      | Buat pickup, lihat pickup sendiri, klaim voucher    |
-| `collector` | Lihat semua pending pickup, ambil task, selesaikan  |
+| Method | Endpoint | Akses |
+|--------|----------|-------|
+| POST | `/auth/register` | Public |
+| POST | `/auth/login` | Public |
+| POST | `/auth/refresh` | Public |
+| POST | `/auth/register-admin` | Secret Key |
+| POST | `/auth/register-collector` | Secret Key |
+| GET | `/auth/profile` | All Auth |
+| GET | `/categories` | Public |
+| POST | `/pickups` | User |
+| GET | `/pickups/my` | User |
+| GET | `/pickups/:id` | User/Collector |
+| PUT | `/collector/status` | Collector |
+| PUT | `/collector/location` | Collector |
+| GET | `/collector/assigned` | Collector |
+| POST | `/collector/pickups/:id/accept` | Collector |
+| POST | `/collector/pickups/:id/start` | Collector |
+| POST | `/collector/pickups/:id/arrive` | Collector |
+| POST | `/collector/pickups/:id/complete` | Collector |
+| GET | `/badges` | All Auth |
+| GET | `/badges/my` | User |
+| POST | `/reports` | User |
+| GET | `/reports/my` | User |
+| GET | `/reports/:id` | User/Admin |
+| POST | `/feedback` | User |
+| GET | `/feedback/my` | User |
+| GET | `/admin/dashboard` | Admin |
+| GET | `/admin/collectors` | Admin |
+| POST | `/admin/collectors` | Admin |
+| DELETE | `/admin/collectors/:id` | Admin |
+| GET | `/admin/pickups` | Admin |
+| GET | `/admin/reports` | Admin |
+| PUT | `/admin/reports/:id` | Admin |
+| GET | `/admin/feedback` | Admin |
+| PUT | `/admin/feedback/:id/respond` | Admin |
 
 ---
 
-## 📋 Dokumentasi Endpoint API
-
-### Base URL
-```
-http://localhost:8080/api/v1
-```
-
----
-
-### 🏥 Health Check
-
-#### `GET /health`
-Cek status server.
-
-**Response (200):**
-```json
-{
-  "status": "ok",
-  "service": "ecotracker"
-}
-```
-
----
-
-### 🔑 Auth
+### Auth
 
 #### `POST /auth/register`
-Daftarkan pengguna baru.
+Daftar akun user baru. Role otomatis `user`.
 
-**Headers:**
-```
-Content-Type: application/json
-```
-
-**Body:**
+**Request:**
 ```json
 {
   "name": "Budi Santoso",
   "email": "budi@example.com",
-  "phone": "08123456789",
   "password": "password123",
-  "role": "user"
+  "phone": "08123456789"
 }
 ```
-> `role` harus `"user"` atau `"collector"`
 
-**Response (201):**
+**Response `201`:**
 ```json
 {
   "success": true,
-  "message": "Registration successful",
+  "message": "Registrasi berhasil",
   "data": {
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "profile": {
-      "id": "uuid-string",
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "expires_in": 900,
+    "user": {
+      "id": "uuid",
       "name": "Budi Santoso",
       "email": "budi@example.com",
       "role": "user",
       "total_points": 0,
-      "created_at": "2026-02-17T13:00:00Z"
+      "total_pickups_completed": 0
     }
   }
 }
@@ -168,14 +250,9 @@ Content-Type: application/json
 ---
 
 #### `POST /auth/login`
-Login dan dapatkan token JWT.
+Login untuk semua role.
 
-**Headers:**
-```
-Content-Type: application/json
-```
-
-**Body:**
+**Request:**
 ```json
 {
   "email": "budi@example.com",
@@ -183,116 +260,145 @@ Content-Type: application/json
 }
 ```
 
-**Response (200):**
+**Response `200`:** _(sama seperti register)_
+
+---
+
+#### `POST /auth/refresh`
+Generate access token baru menggunakan refresh token.
+
+**Request:**
 ```json
 {
-  "success": true,
-  "message": "Login successful",
-  "data": {
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "profile": {
-      "id": "uuid-string",
-      "name": "Budi Santoso",
-      "email": "budi@example.com",
-      "role": "user",
-      "total_points": 250
-    }
-  }
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 }
 ```
+
+**Response `200`:** _(sama seperti login)_
+
+---
+
+#### `POST /auth/register-admin`
+Buat akun admin. Membutuhkan header secret key.
+
+**Header:**
+```
+X-Admin-Secret: ecotracker-admin-secret-2026
+```
+
+**Request:**
+```json
+{
+  "name": "Super Admin",
+  "email": "admin@ecotracker.com",
+  "password": "Admin@2026",
+  "phone": "08100000000"
+}
+```
+
+**Response `201`:** _(sama seperti register, role = `admin`)_
+
+---
+
+#### `POST /auth/register-collector`
+Buat akun collector. Membutuhkan header secret key.
+
+**Header:**
+```
+X-Admin-Secret: ecotracker-admin-secret-2026
+```
+
+**Request:**
+```json
+{
+  "name": "Collector Test",
+  "email": "collector@ecotracker.com",
+  "password": "Collector@2026",
+  "phone": "08111111111"
+}
+```
+
+**Response `201`:** _(sama seperti register, role = `collector`)_
 
 ---
 
 #### `GET /auth/profile`
-Dapatkan profil pengguna yang sedang login.
+Ambil profil user yang sedang login.
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Profile retrieved",
   "data": {
-    "id": "uuid-string",
+    "id": "uuid",
     "name": "Budi Santoso",
     "email": "budi@example.com",
-    "phone": "08123456789",
     "role": "user",
-    "total_points": 250,
-    "address_default": "Jl. Merdeka No. 1, Jakarta",
-    "created_at": "2026-02-17T13:00:00Z"
+    "total_points": 150,
+    "total_pickups_completed": 5,
+    "total_reports_submitted": 2,
+    "is_online": false,
+    "average_rating": 0
   }
 }
 ```
 
 ---
 
-### ♻️ Kategori Sampah
+### Categories
 
 #### `GET /categories`
-Dapatkan semua kategori sampah beserta nilai poin per kg.
+Ambil semua kategori sampah. **Tidak perlu token.**
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Waste categories retrieved",
   "data": [
-    { "id": 1, "name": "Kertas / Kardus", "points_per_kg": 10, "unit": "kg" },
-    { "id": 2, "name": "Plastik",         "points_per_kg": 15, "unit": "kg" },
-    { "id": 3, "name": "Logam / Besi",    "points_per_kg": 20, "unit": "kg" },
-    { "id": 4, "name": "Elektronik (E-Waste)", "points_per_kg": 50, "unit": "kg" }
+    { "id": "uuid", "name": "Plastik", "points_per_kg": 15, "color_hex": "#3498DB" },
+    { "id": "uuid", "name": "Kertas",  "points_per_kg": 10, "color_hex": "#F39C12" },
+    { "id": "uuid", "name": "Logam",   "points_per_kg": 20, "color_hex": "#95A5A6" },
+    { "id": "uuid", "name": "Kaca",    "points_per_kg": 12, "color_hex": "#1ABC9C" },
+    { "id": "uuid", "name": "Organik", "points_per_kg": 5,  "color_hex": "#27AE60" }
   ]
 }
 ```
 
 ---
 
-### 📦 Pickup (User)
+### Pickups (User)
 
 #### `POST /pickups`
-Buat permintaan jemput sampah baru. Mendukung upload foto.
+Buat pickup request baru. Setelah dibuat, sistem otomatis mencari collector terdekat.
 
-**Headers:**
-```
-Authorization: Bearer <token>
-Content-Type: multipart/form-data
-```
+> ⚠️ Gunakan `Content-Type: multipart/form-data`
 
 **Form Data:**
-| Field       | Type    | Keterangan                                   |
-|-------------|---------|----------------------------------------------|
-| `address`   | string  | **Wajib.** Alamat lengkap                    |
-| `latitude`  | float   | **Wajib.** Koordinat GPS latitude             |
-| `longitude` | float   | **Wajib.** Koordinat GPS longitude            |
-| `notes`     | string  | Opsional. Catatan tambahan                   |
-| `photo`     | file    | Opsional. Foto sampah (JPG/PNG/WebP, max 10MB) |
 
-**Response (201):**
+| Field | Type | Wajib | Keterangan |
+|-------|------|-------|------------|
+| `address` | Text | ✅ | Alamat lengkap |
+| `lat` | Text | ✅ | Latitude (contoh: `-6.2088`) |
+| `lon` | Text | ✅ | Longitude (contoh: `106.8456`) |
+| `notes` | Text | ❌ | Catatan untuk collector |
+| `photo` | File | ❌ | Foto sampah (jpg/png/webp, max 5MB) |
+
+**Response `201`:**
 ```json
 {
   "success": true,
-  "message": "Pickup request created successfully",
+  "message": "Pickup berhasil dibuat, mencari collector terdekat...",
   "data": {
-    "id": "uuid-pickup",
-    "user_id": "uuid-user",
-    "collector_id": "",
+    "id": "a481bd18-d6a1-4a2b-8e7a-99b6ef7ec4bc",
+    "user_id": "user-uuid",
+    "address": "Jl. Sudirman No. 5, Jakarta Pusat",
+    "lat": -6.2088,
+    "lon": 106.8456,
+    "notes": "Sampah di depan pagar biru",
+    "photo_url": "https://xxx.supabase.co/storage/v1/object/public/waste-photos/...",
     "status": "pending",
-    "address": "Jl. Sudirman No. 5, Jakarta",
-    "latitude": -6.2088,
-    "longitude": 106.8456,
-    "photo_url": "https://xxx.supabase.co/storage/v1/object/public/pickups/...",
-    "notes": "Sampah di depan pagar",
-    "created_at": "2026-02-17T13:00:00Z"
+    "reassignment_count": 0,
+    "created_at": "2026-03-20T09:18:11Z"
   }
 }
 ```
@@ -300,234 +406,261 @@ Content-Type: multipart/form-data
 ---
 
 #### `GET /pickups/my`
-Lihat semua pickup milik user yang login.
+Riwayat pickup milik user.
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
+**Query Params:** `?page=1&limit=20`
 
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "My pickups retrieved",
-  "data": [
-    {
-      "id": "uuid-pickup",
-      "status": "completed",
-      "address": "Jl. Sudirman No. 5",
-      "created_at": "2026-02-17T13:00:00Z"
-    }
-  ]
+  "data": {
+    "data": [
+      {
+        "id": "uuid",
+        "status": "completed",
+        "address": "Jl. Sudirman No. 5",
+        "total_weight": 3.5,
+        "total_points_awarded": 47,
+        "collector": {
+          "name": "Budi Collector",
+          "average_rating": 4.8
+        },
+        "created_at": "2026-03-20T09:18:11Z",
+        "completed_at": "2026-03-20T09:45:00Z"
+      }
+    ],
+    "total": 5,
+    "page": 1,
+    "limit": 20,
+    "total_pages": 1
+  }
 }
 ```
 
 ---
 
 #### `GET /pickups/:id`
-Lihat detail pickup tertentu (user hanya bisa lihat miliknya, collector bisa lihat semua).
+Detail satu pickup. User hanya bisa akses pickup miliknya.
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Pickup detail retrieved",
   "data": {
-    "id": "uuid-pickup",
+    "id": "uuid",
     "status": "completed",
-    "address": "Jl. Sudirman No. 5",
-    "latitude": -6.2088,
-    "longitude": 106.8456,
+    "address": "Jl. Sudirman No. 5, Jakarta Pusat",
+    "lat": -6.2088,
+    "lon": 106.8456,
     "photo_url": "https://...",
-    "completed_at": "2026-02-17T14:30:00Z",
+    "notes": "Sampah di depan pagar",
+    "total_weight": 3.5,
+    "total_points_awarded": 47,
+    "user": { "name": "Budi Santoso", "phone": "08123456789" },
+    "collector": { "name": "Collector Budi", "average_rating": 4.8 },
     "items": [
-      { "category_id": 2, "weight": 3.5, "subtotal_points": 52 },
-      { "category_id": 1, "weight": 5.0, "subtotal_points": 50 }
-    ]
+      { "category": { "name": "Plastik" }, "weight_kg": 2.5, "points_awarded": 37 },
+      { "category": { "name": "Kertas" },  "weight_kg": 1.0, "points_awarded": 10 }
+    ],
+    "assigned_at": "2026-03-20T09:19:00Z",
+    "accepted_at": "2026-03-20T09:20:00Z",
+    "completed_at": "2026-03-20T09:45:00Z"
   }
 }
 ```
 
+**Status Pickup:**
+
+| Status | Keterangan |
+|--------|------------|
+| `pending` | Menunggu collector tersedia |
+| `assigned` | Ditugaskan ke collector, menunggu konfirmasi (15 menit) |
+| `accepted` | Collector konfirmasi, segera berangkat |
+| `in_progress` | Collector dalam perjalanan |
+| `arrived` | Collector tiba di lokasi |
+| `completed` | Selesai, poin sudah diberikan |
+| `cancelled` | Dibatalkan |
+
 ---
 
-### 🚚 Collector Workflow
+### Collector
 
-#### `GET /collector/pickups/pending`
-Dashboard collector — lihat semua pickup berstatus `pending`.
+> Semua endpoint collector membutuhkan token dengan role `collector`.
 
-**Headers:**
+#### `PUT /collector/status`
+Toggle status online/offline. Hanya collector **online** yang bisa menerima assignment.
+
+**Request:**
+```json
+{ "is_online": true }
 ```
-Authorization: Bearer <token>  (role: collector)
-```
 
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Pending pickups retrieved",
-  "data": [
-    {
-      "id": "uuid-1",
-      "user_id": "uuid-user",
-      "status": "pending",
-      "address": "Jl. Kebon Jeruk, Jakarta",
-      "latitude": -6.1944,
-      "longitude": 106.7893,
-      "photo_url": "https://...",
-      "created_at": "2026-02-17T10:00:00Z"
-    }
-  ]
+  "message": "Status berhasil diubah menjadi online",
+  "data": { "is_online": true }
 }
 ```
 
 ---
 
-#### `GET /collector/pickups/my-tasks`
-Lihat semua task yang sudah diambil oleh collector ini.
+#### `PUT /collector/location`
+Update koordinat GPS collector. Wajib diupdate secara berkala.
 
-**Headers:**
-```
-Authorization: Bearer <token>  (role: collector)
-```
+> ⚠️ Lokasi tidak diupdate lebih dari **30 menit** → dianggap tidak tersedia untuk assignment.
 
-**Response (200):** _(format sama seperti di atas)_
-
----
-
-#### `POST /collector/pickups/:id/take`
-Ambil task pickup dari status `pending` menjadi `taken`.
-
-**Headers:**
-```
-Authorization: Bearer <token>  (role: collector)
+**Request:**
+```json
+{
+  "lat": -6.2100,
+  "lon": 106.8400
+}
 ```
 
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Task taken successfully",
+  "message": "Lokasi diperbarui",
+  "data": { "lat": -6.21, "lon": 106.84 }
+}
+```
+
+---
+
+#### `GET /collector/assigned`
+Lihat pickup yang sedang aktif ditugaskan ke collector.
+
+**Response `200` (ada pickup):**
+```json
+{
+  "success": true,
   "data": {
-    "id": "uuid-pickup",
-    "collector_id": "uuid-collector",
-    "status": "taken",
-    "address": "Jl. Kebon Jeruk, Jakarta"
+    "id": "pickup-uuid",
+    "status": "assigned",
+    "address": "Jl. Sudirman No. 5, Jakarta Pusat",
+    "lat": -6.2088,
+    "lon": 106.8456,
+    "photo_url": "https://...",
+    "assignment_timeout": "2026-03-20T09:33:00Z",
+    "user": {
+      "name": "Budi Santoso",
+      "phone": "08123456789"
+    }
   }
+}
+```
+
+**Response `200` (tidak ada):**
+```json
+{ "success": true, "message": "Tidak ada pickup aktif", "data": null }
+```
+
+---
+
+#### `POST /collector/pickups/:id/accept`
+Terima pickup yang ditugaskan. Harus dilakukan sebelum timeout **15 menit**.
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "message": "Pickup berhasil diterima",
+  "data": { "id": "uuid", "status": "accepted", "accepted_at": "2026-03-20T09:20:00Z" }
+}
+```
+
+---
+
+#### `POST /collector/pickups/:id/start`
+Mulai berangkat menuju lokasi user.
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "message": "Pickup dimulai, menuju ke lokasi user",
+  "data": { "status": "in_progress", "started_at": "2026-03-20T09:22:00Z" }
+}
+```
+
+---
+
+#### `POST /collector/pickups/:id/arrive`
+Tandai bahwa collector sudah tiba di lokasi user.
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "message": "Berhasil dicatat, collector telah tiba di lokasi",
+  "data": { "status": "arrived", "arrived_at": "2026-03-20T09:35:00Z" }
 }
 ```
 
 ---
 
 #### `POST /collector/pickups/:id/complete`
-Selesaikan task pickup (transaksi atomik: update status, simpan item, tambah poin, catat log).
+Selesaikan pickup. Input detail sampah yang dikumpulkan. Poin otomatis dihitung dan diberikan ke user.
 
-**Headers:**
-```
-Authorization: Bearer <token>  (role: collector)
-Content-Type: application/json
-```
+> Formula: **Poin = weight_kg × points_per_kg** (sesuai kategori)
 
-**Body:**
+**Request:**
 ```json
 {
   "items": [
-    { "category_id": 2, "weight": 3.5 },
-    { "category_id": 1, "weight": 5.0 }
-  ]
-}
-```
-
-> Sistem akan otomatis menghitung poin:
-> - Plastik (3.5 kg × 15 poin/kg = 52 poin)
-> - Kertas (5.0 kg × 10 poin/kg = 50 poin)
-> - **Total: 102 poin** ditambahkan ke akun user
-
-**Response (200):**
-```json
-{
-  "success": true,
-  "message": "Pickup completed. Points awarded successfully",
-  "data": {
-    "id": "uuid-pickup",
-    "status": "completed",
-    "completed_at": "2026-02-17T14:30:00Z",
-    "items": [
-      { "category_id": 2, "weight": 3.5, "subtotal_points": 52 },
-      { "category_id": 1, "weight": 5.0, "subtotal_points": 50 }
-    ]
-  }
-}
-```
-
----
-
-### 💰 Poin
-
-#### `GET /points/logs`
-Lihat riwayat transaksi poin (earn/spend).
-
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{
-  "success": true,
-  "message": "Point logs retrieved",
-  "data": [
     {
-      "id": 1,
-      "user_id": "uuid-user",
-      "amount": 102,
-      "transaction_type": "earn",
-      "reference_id": "uuid-pickup",
-      "description": "Points earned from waste pickup",
-      "created_at": "2026-02-17T14:30:00Z"
+      "category_id": "uuid-kategori-plastik",
+      "weight_kg": 2.5
     },
     {
-      "id": 2,
-      "amount": 100,
-      "transaction_type": "spend",
-      "description": "Points spent on voucher redemption",
-      "created_at": "2026-02-17T15:00:00Z"
+      "category_id": "uuid-kategori-kertas",
+      "weight_kg": 1.0
     }
   ]
 }
 ```
 
----
-
-### 🎁 Voucher
-
-#### `GET /vouchers`
-Lihat semua voucher yang tersedia (aktif & stok > 0).
-
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Available vouchers retrieved",
+  "message": "Pickup selesai! Poin telah diberikan ke user",
+  "data": {
+    "id": "pickup-uuid",
+    "status": "completed",
+    "total_weight": 3.5,
+    "total_points_awarded": 47,
+    "completed_at": "2026-03-20T09:45:00Z"
+  }
+}
+```
+
+> Setelah complete, sistem otomatis mengecek dan memberikan badge yang memenuhi kriteria.
+
+---
+
+### Badges
+
+#### `GET /badges`
+Semua definisi badge yang ada di sistem.
+
+**Response `200`:**
+```json
+{
+  "success": true,
   "data": [
     {
-      "id": 1,
-      "title": "Voucher Belanja Rp 10.000",
-      "description": "Diskon belanja Rp 10.000 di mitra kami",
-      "point_cost": 100,
-      "stock": 50,
-      "is_active": true
+      "id": "uuid",
+      "code": "first_pickup",
+      "name": "Pickup Pertama",
+      "description": "Selesaikan pickup pertamamu",
+      "criteria_type": "pickups",
+      "criteria_value": 1,
+      "display_order": 1
     }
   ]
 }
@@ -535,127 +668,330 @@ Authorization: Bearer <token>
 
 ---
 
-#### `POST /vouchers/:id/claim`
-Tukar poin untuk mendapatkan voucher.
+#### `GET /badges/my`
+Badge milik user dengan status locked/unlocked.
 
-**Headers:**
-```
-Authorization: Bearer <token>  (role: user)
-```
-
-**Response (201):**
+**Response `200`:**
 ```json
 {
   "success": true,
-  "message": "Voucher claimed successfully",
-  "data": {
-    "id": 1,
-    "user_id": "uuid-user",
-    "voucher_id": 1,
-    "claim_code": "ECO-a1b2c3d4",
-    "is_used": false,
-    "claimed_at": "2026-02-17T15:00:00Z",
-    "voucher": {
-      "title": "Voucher Belanja Rp 10.000",
-      "point_cost": 100
+  "data": [
+    {
+      "code": "first_pickup",
+      "name": "Pickup Pertama",
+      "criteria_value": 1,
+      "is_unlocked": true,
+      "awarded_at": "2026-03-20T09:45:00Z"
+    },
+    {
+      "code": "eco_warrior",
+      "name": "Eco Warrior",
+      "criteria_value": 10,
+      "is_unlocked": false,
+      "awarded_at": null
     }
+  ]
+}
+```
+
+---
+
+### Reports
+
+#### `POST /reports`
+Laporkan area kotor dengan foto.
+
+> ⚠️ Gunakan `Content-Type: multipart/form-data`
+
+**Form Data:**
+
+| Field | Type | Wajib | Keterangan |
+|-------|------|-------|------------|
+| `title` | Text | ✅ | Judul laporan (min 5 karakter) |
+| `description` | Text | ✅ | Deskripsi detail (min 10 karakter) |
+| `address` | Text | ✅ | Alamat area yang dilaporkan |
+| `lat` | Text | ✅ | Latitude |
+| `lon` | Text | ✅ | Longitude |
+| `severity` | Text | ✅ | `low` / `medium` / `high` |
+| `photos` | File[] | ❌ | Foto area (bisa multiple, max 5) |
+
+**Response `201`:**
+```json
+{
+  "success": true,
+  "message": "Laporan berhasil dikirim",
+  "data": {
+    "id": "uuid",
+    "title": "Tumpukan Sampah di Pinggir Jalan",
+    "severity": "high",
+    "status": "new",
+    "photo_urls": ["https://..."],
+    "created_at": "2026-03-20T10:00:00Z"
+  }
+}
+```
+
+**Status Laporan:**
+
+| Status | Keterangan |
+|--------|------------|
+| `new` | Laporan baru masuk |
+| `investigating` | Admin sedang menginvestigasi |
+| `assigned` | Tim kebersihan sudah ditugaskan |
+| `in_progress` | Proses pembersihan berlangsung |
+| `resolved` | Selesai dibersihkan |
+
+---
+
+#### `GET /reports/my`
+Riwayat laporan milik user. `?page=1&limit=20`
+
+---
+
+#### `GET /reports/:id`
+Detail laporan tertentu.
+
+---
+
+### Feedback
+
+#### `POST /feedback`
+Kirim feedback atau rating untuk collector.
+
+**Request:**
+```json
+{
+  "feedback_type": "collector",
+  "pickup_id": "uuid-pickup",
+  "rating": 5,
+  "title": "Pelayanan sangat baik",
+  "comment": "Collector sangat ramah dan tepat waktu",
+  "tags": ["Fast Service", "Friendly", "Professional"]
+}
+```
+
+> `feedback_type`: `app` | `collector` | `general`
+> Rating 1-5 wajib diisi jika `feedback_type` = `collector`
+
+**Response `201`:**
+```json
+{
+  "success": true,
+  "message": "Feedback berhasil dikirim, terima kasih!",
+  "data": { "id": "uuid", "rating": 5, "created_at": "2026-03-20T10:00:00Z" }
+}
+```
+
+---
+
+#### `GET /feedback/my`
+Riwayat feedback yang sudah dikirim user. `?page=1&limit=20`
+
+---
+
+### Admin
+
+> Semua endpoint admin membutuhkan token dengan role `admin`.
+
+#### `GET /admin/dashboard`
+Statistik keseluruhan sistem.
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "data": {
+    "total_users": 150,
+    "total_collectors": 25,
+    "online_collectors": 8,
+    "total_pickups": 320,
+    "pending_pickups": 5,
+    "completed_pickups": 290,
+    "total_weight_kg": 1250.75,
+    "total_reports": 45,
+    "new_reports": 3
   }
 }
 ```
 
 ---
 
-#### `GET /vouchers/my`
-Lihat semua voucher yang sudah diklaim oleh user.
+#### `GET /admin/collectors`
+Daftar semua collector. `?page=1&limit=20`
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
+---
 
-**Response (200):**
+#### `POST /admin/collectors`
+Buat akun collector baru (tidak perlu secret key, sudah pakai token admin).
+
+**Request:**
 ```json
 {
-  "success": true,
-  "message": "My vouchers retrieved",
-  "data": [
-    {
-      "id": 1,
-      "claim_code": "ECO-a1b2c3d4",
-      "is_used": false,
-      "claimed_at": "2026-02-17T15:00:00Z",
-      "voucher": {
-        "title": "Voucher Belanja Rp 10.000",
-        "point_cost": 100
-      }
-    }
-  ]
+  "name": "Collector Baru",
+  "email": "collector.baru@ecotracker.com",
+  "password": "Collector@2026",
+  "phone": "08199999999"
 }
 ```
 
 ---
 
-## ❌ Error Responses
+#### `DELETE /admin/collectors/:id`
+Soft delete akun collector.
 
-Semua error menggunakan format konsisten:
+---
 
+#### `GET /admin/pickups`
+Semua pickup dengan filter opsional.
+
+**Query Params:** `?status=pending&page=1&limit=20`
+
+---
+
+#### `GET /admin/reports`
+Semua laporan area kotor.
+
+**Query Params:** `?status=new&severity=high&page=1&limit=20`
+
+---
+
+#### `PUT /admin/reports/:id`
+Update status laporan.
+
+**Request:**
+```json
+{
+  "status": "investigating",
+  "admin_notes": "Tim sedang menuju lokasi",
+  "assigned_to": "uuid-collector"
+}
+```
+
+---
+
+#### `GET /admin/feedback`
+Semua feedback. `?type=collector&page=1&limit=20`
+
+---
+
+#### `PUT /admin/feedback/:id/respond`
+Admin membalas feedback user.
+
+**Request:**
+```json
+{
+  "response": "Terima kasih atas feedbacknya. Kami akan terus meningkatkan layanan."
+}
+```
+
+---
+
+## Sistem Poin & Badge
+
+### Poin per Kategori Sampah
+
+| Kategori | Poin per Kg |
+|----------|-------------|
+| 🔵 Plastik | 15 poin |
+| 🟡 Kertas | 10 poin |
+| ⚫ Logam | 20 poin |
+| 🟢 Kaca | 12 poin |
+| 🌱 Organik | 5 poin |
+
+### Daftar Badge
+
+| Badge | Kriteria | Target |
+|-------|----------|--------|
+| 🥇 Pickup Pertama | Jumlah pickup | 1 |
+| 🌿 Eco Warrior | Jumlah pickup | 10 |
+| 🌳 Eco Champion | Jumlah pickup | 50 |
+| 🏆 Eco Legend | Jumlah pickup | 100 |
+| 💎 Point Master | Total poin | 1.000 |
+| 👑 Point Legend | Total poin | 5.000 |
+| 📢 Reporter Hero | Jumlah laporan | 5 |
+| 🛡️ Community Guardian | Jumlah laporan | 20 |
+
+Badge diberikan **otomatis** setelah pickup atau laporan berhasil diselesaikan.
+
+---
+
+## Alur Auto-Assignment
+
+```
+User buat pickup
+      ↓
+Sistem cari collector: is_online=true, is_busy=false, lokasi < 30 menit lalu
+      ↓
+Hitung jarak Haversine ke setiap collector
+      ↓
+Assign ke collector TERDEKAT (atomik)
+      ↓
+Collector punya 15 menit untuk Accept
+      ↓
+Timeout? → Release collector lama → Cari collector berikutnya
+      ↓
+Maksimum 5x reassignment → Status kembali ke pending
+```
+
+**Background Worker** berjalan setiap **60 detik** mengecek assignment yang expired.
+
+---
+
+## Error Codes
+
+| Code | Keterangan |
+|------|------------|
+| `200` | OK |
+| `201` | Created |
+| `400` | Bad Request — validasi input gagal |
+| `401` | Unauthorized — token tidak ada / expired |
+| `403` | Forbidden — role tidak punya izin |
+| `404` | Not Found — data tidak ditemukan |
+| `409` | Conflict — email sudah terdaftar / status konflik |
+| `429` | Too Many Requests — rate limit (100 req/menit per IP) |
+| `500` | Internal Server Error |
+| `503` | Service Unavailable — tidak ada collector tersedia |
+
+**Format Error Response:**
 ```json
 {
   "success": false,
-  "error": "pesan error di sini"
+  "error": "Pesan error yang menjelaskan masalah"
 }
 ```
 
-| HTTP Status | Kondisi                                           |
-|-------------|---------------------------------------------------|
-| `400`       | Request tidak valid / body salah                  |
-| `401`       | Token tidak ada / expired / kredensial salah      |
-| `403`       | Role tidak cukup (user coba akses endpoint collector) |
-| `404`       | Resource tidak ditemukan                          |
-| `409`       | Konflik (email sudah terdaftar, pickup sudah diambil) |
-| `500`       | Internal server error                             |
-
 ---
 
-## 🔄 Alur Lengkap (Happy Path)
+## Cara Test di Postman
 
+### 1. Buat Akun Admin
 ```
-1. User REGISTER (role: user)
-2. User LOGIN → dapat JWT
-3. User POST /pickups → upload foto sampah + GPS
-   ↓ Foto diproses (resize, konversi ke JPEG) lalu upload ke Supabase Storage
-4. Collector LOGIN (role: collector)
-5. Collector GET /collector/pickups/pending → lihat list
-6. Collector POST /collector/pickups/:id/take → ambil task
-7. Collector POST /collector/pickups/:id/complete + {items: [...]}
-   ↓ DB Transaction Atomik:
-     a. UPDATE pickups SET status='completed'
-     b. INSERT pickup_items (detail berat per kategori)
-     c. UPDATE profiles SET total_points = total_points + {total}
-     d. INSERT point_logs (transaction_type='earn')
-8. User GET /points/logs → lihat poin bertambah
-9. User GET /vouchers → lihat voucher tersedia
-10. User POST /vouchers/:id/claim
-    ↓ DB Transaction Atomik:
-      a. UPDATE profiles SET total_points = total_points - {cost}
-      b. UPDATE vouchers SET stock = stock - 1
-      c. INSERT user_vouchers (dengan claim_code unik)
-      d. INSERT point_logs (transaction_type='spend')
-11. User GET /vouchers/my → lihat kode voucher
+POST /api/v1/auth/register-admin
+Header: X-Admin-Secret: ecotracker-admin-secret-2026
+```
+
+### 2. Buat Akun Collector
+```
+POST /api/v1/auth/register-collector
+Header: X-Admin-Secret: ecotracker-admin-secret-2026
+```
+
+### 3. Test Alur Pickup Lengkap
+```
+1. Login sebagai collector → simpan token
+2. PUT /collector/location → update GPS collector
+3. PUT /collector/status → { "is_online": true }
+4. Login sebagai user → simpan token
+5. POST /pickups → buat pickup (form-data)
+6. GET /pickups/my → cek status (harusnya "assigned")
+7. POST /collector/pickups/:id/accept → collector terima
+8. POST /collector/pickups/:id/start → mulai berangkat
+9. POST /collector/pickups/:id/arrive → tiba di lokasi
+10. POST /collector/pickups/:id/complete → selesaikan + input sampah
+11. GET /auth/profile (user) → cek poin bertambah
+12. GET /badges/my (user) → cek badge baru
 ```
 
 ---
 
-## 🛠️ Tech Stack
-
-| Komponen        | Library/Service                          |
-|-----------------|------------------------------------------|
-| Framework       | [Gin Gonic](https://gin-gonic.com/)      |
-| Database        | PostgreSQL via [pgx/v5](https://github.com/jackc/pgx) |
-| Database Host   | [Supabase](https://supabase.com/)        |
-| Storage         | Supabase Storage (REST API)              |
-| Auth            | JWT via [golang-jwt/jwt](https://github.com/golang-jwt/jwt) |
-| Password Hash   | bcrypt via [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) |
-| Image Processing| [disintegration/imaging](https://github.com/disintegration/imaging) |
-| UUID            | [google/uuid](https://github.com/google/uuid) |
-| Config          | [joho/godotenv](https://github.com/joho/godotenv) |
+*EcoTracker V2.0 — Go + PostgreSQL + Supabase*
