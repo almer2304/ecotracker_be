@@ -9,6 +9,7 @@ import (
 	"github.com/ecotracker/backend/internal/domain"
 	"github.com/ecotracker/backend/internal/repository"
 	"github.com/ecotracker/backend/internal/utils"
+	ws "github.com/ecotracker/backend/internal/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,41 +17,46 @@ import (
 type AssignmentService struct {
 	pickupRepo    *repository.PickupRepository
 	collectorRepo *repository.CollectorRepository
+	authRepo      *repository.AuthRepository
 	timeout       time.Duration
 	db            *sql.DB
+	notifier      *ws.Notifier // WebSocket notifier
 }
 
 func NewAssignmentService(
 	pickupRepo *repository.PickupRepository,
 	collectorRepo *repository.CollectorRepository,
+	authRepo *repository.AuthRepository,
 	db *sql.DB,
 	timeout time.Duration,
+	notifier *ws.Notifier,
 ) *AssignmentService {
 	return &AssignmentService{
 		pickupRepo:    pickupRepo,
 		collectorRepo: collectorRepo,
+		authRepo:      authRepo,
 		timeout:       timeout,
 		db:            db,
+		notifier:      notifier,
 	}
 }
 
-// AssignClosestCollector adalah algoritma inti auto-assignment
-// Mencari collector terdekat yang online & tidak busy, lalu menugaskan secara atomik
+// AssignClosestCollector algoritma inti auto-assignment
 func (s *AssignmentService) AssignClosestCollector(ctx context.Context, pickupID string, pickupLat, pickupLon float64, excludeIDs []string) error {
 	log := logrus.WithField("pickup_id", pickupID)
 
-	// 1. Ambil semua collector yang tersedia (online, tidak busy, lokasi baru)
+	// 1. Ambil semua collector yang tersedia
 	collectors, err := s.collectorRepo.FindAvailable(ctx, excludeIDs)
 	if err != nil {
 		return fmt.Errorf("cari collector: %w", err)
 	}
 
 	if len(collectors) == 0 {
-		log.Warn("Tidak ada collector tersedia untuk pickup ini")
+		log.Warn("Tidak ada collector tersedia")
 		return domain.ErrNoCollectorAvailable
 	}
 
-	// 2. Hitung jarak dari setiap collector ke lokasi pickup
+	// 2. Hitung jarak Haversine ke setiap collector
 	withDistances := make([]utils.CollectorWithDistance, 0, len(collectors))
 	for _, c := range collectors {
 		if c.LastLat == nil || c.LastLon == nil {
@@ -73,7 +79,7 @@ func (s *AssignmentService) AssignClosestCollector(ctx context.Context, pickupID
 	utils.SortByDistance(withDistances)
 	nearest := withDistances[0]
 
-	// 4. Atomic transaction: assign pickup + set collector busy + catat history
+	// 4. Atomic transaction: assign pickup + set collector busy
 	tx, err := s.pickupRepo.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("mulai transaksi: %w", err)
@@ -86,14 +92,55 @@ func (s *AssignmentService) AssignClosestCollector(ctx context.Context, pickupID
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaksi: %w", err)
+		return fmt.Errorf("commit: %w", err)
 	}
 
 	log.WithFields(logrus.Fields{
 		"collector_id": nearest.ID,
 		"distance_km":  fmt.Sprintf("%.2f", nearest.DistanceKm),
-		"timeout":      assignTimeout,
-	}).Info("Pickup berhasil ditugaskan ke collector terdekat")
+	}).Info("Pickup berhasil ditugaskan")
+
+	// 5. Kirim notifikasi WebSocket ke collector (async)
+	go func() {
+		if s.notifier == nil {
+			return
+		}
+
+		// Ambil detail pickup untuk notifikasi
+		pickup, err := s.pickupRepo.GetByID(context.Background(), pickupID)
+		if err != nil {
+			return
+		}
+
+		userName := ""
+		if pickup.User != nil {
+			userName = pickup.User.Name
+		}
+
+		notifData := ws.NewPickupData{
+			PickupID:  pickupID,
+			Address:   pickup.Address,
+			Lat:       pickup.Lat,
+			Lon:       pickup.Lon,
+			PhotoURL:  pickup.PhotoURL,
+			Notes:     pickup.Notes,
+			Distance:  nearest.DistanceKm,
+			UserName:  userName,
+			CreatedAt: pickup.CreatedAt.Format(time.RFC3339),
+		}
+
+		s.notifier.NotifyNewPickup(nearest.ID, notifData)
+
+		// Notify user bahwa pickupnya sudah di-assign
+		collectorName := ""
+		for _, c := range collectors {
+			if c.ID == nearest.ID {
+				collectorName = c.Name
+				break
+			}
+		}
+		s.notifier.NotifyPickupAssigned(pickup.UserID, pickupID, collectorName)
+	}()
 
 	return nil
 }
@@ -105,15 +152,13 @@ func (s *AssignmentService) ReassignPickup(ctx context.Context, pickup domain.Pi
 	}
 
 	log := logrus.WithFields(logrus.Fields{
-		"pickup_id":    pickup.ID,
+		"pickup_id":     pickup.ID,
 		"old_collector": *pickup.CollectorID,
 	})
 	log.Info("Memulai reassignment pickup")
 
-	// Kumpulkan ID collector yang pernah ditugaskan (dari assignment_history)
 	excludeIDs := s.getTriedCollectorIDs(context.Background(), pickup.ID)
 
-	// Atomic: release collector lama
 	tx, err := s.pickupRepo.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -128,12 +173,10 @@ func (s *AssignmentService) ReassignPickup(ctx context.Context, pickup domain.Pi
 		return err
 	}
 
-	// Cari collector baru (kecualikan yang sudah pernah dicoba)
 	err = s.AssignClosestCollector(ctx, pickup.ID, pickup.Lat, pickup.Lon, excludeIDs)
 	if err != nil {
 		if err == domain.ErrNoCollectorAvailable {
-			log.Warn("Tidak ada collector pengganti, pickup tetap pending")
-			// Update status ke pending agar bisa di-assign ulang nanti
+			log.Warn("Tidak ada collector pengganti, pickup kembali ke pending")
 			s.pickupRepo.UpdateStatus(ctx, pickup.ID, domain.StatusPending, nil)
 			return nil
 		}
@@ -144,7 +187,6 @@ func (s *AssignmentService) ReassignPickup(ctx context.Context, pickup domain.Pi
 	return nil
 }
 
-// getTriedCollectorIDs mengambil daftar ID collector yang pernah ditugaskan
 func (s *AssignmentService) getTriedCollectorIDs(ctx context.Context, pickupID string) []string {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT DISTINCT collector_id FROM assignment_history WHERE pickup_id = $1`,

@@ -16,76 +16,59 @@ import (
 	"github.com/ecotracker/backend/internal/repository"
 	"github.com/ecotracker/backend/internal/service"
 	"github.com/ecotracker/backend/internal/utils"
+	ws "github.com/ecotracker/backend/internal/websocket"
 	"github.com/ecotracker/backend/internal/worker"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
 
 func main() {
-	// ============================================================
-	// 1. INISIALISASI LOGGING
-	// ============================================================
-	logrus.SetFormatter(&logrus.JSONFormatter{
-		TimestampFormat: "2006-01-02 15:04:05",
-	})
+	// 1. LOGGING
+	logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: "2006-01-02 15:04:05"})
 	logrus.SetLevel(logrus.InfoLevel)
 
-	// ============================================================
-	// 2. LOAD KONFIGURASI
-	// ============================================================
+	// 2. CONFIG
 	cfg, err := config.Load()
 	if err != nil {
 		logrus.WithError(err).Fatal("Gagal memuat konfigurasi")
 	}
-
 	if cfg.App.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
-		logrus.SetLevel(logrus.WarnLevel)
 	}
-
 	logrus.WithField("env", cfg.App.Env).Info("EcoTracker V2.0 Backend dimulai")
 
-	// ============================================================
-	// 3. INISIALISASI DATABASE
-	// ============================================================
+	// 3. DATABASE
 	db, err := config.NewDatabase(&cfg.DB)
 	if err != nil {
 		logrus.WithError(err).Fatal("Gagal terhubung ke database")
 	}
 	defer db.Close()
 
-	// ============================================================
-	// 4. INISIALISASI REDIS (opsional)
-	// ============================================================
+	// 4. REDIS
 	redisClient, _ := config.NewRedis(&cfg.Redis)
 	if redisClient != nil {
 		defer redisClient.Close()
 	}
 
-	// ============================================================
-	// 5. INISIALISASI UTILITIES
-	// ============================================================
-	jwtManager := utils.NewJWTManager(
-		cfg.JWT.Secret,
-		cfg.JWT.AccessExpiry,
-		cfg.JWT.RefreshExpiry,
-	)
+	// 5. UTILITIES
+	jwtManager := utils.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessExpiry, cfg.JWT.RefreshExpiry)
 
 	var storageClient *utils.StorageClient
 	if cfg.Supabase.URL != "" && cfg.Supabase.Key != "" {
 		storageClient = utils.NewStorageClient(
-			cfg.Supabase.URL,
-			cfg.Supabase.Key,
-			cfg.Supabase.BucketPickups,
-			cfg.Supabase.BucketReports,
-			cfg.Supabase.BucketAvatars,
+			cfg.Supabase.URL, cfg.Supabase.Key,
+			cfg.Supabase.BucketPickups, cfg.Supabase.BucketReports, cfg.Supabase.BucketAvatars,
 		)
-		logrus.Info("Supabase Storage terhubung")
 	}
 
-	// ============================================================
-	// 6. INISIALISASI REPOSITORIES
-	// ============================================================
+	// 6. WEBSOCKET HUB
+	wsHub := ws.NewHub()
+	go wsHub.Run()
+	wsNotifier := ws.NewNotifier(wsHub)
+	wsHandler := ws.NewHandler(wsHub)
+	logrus.Info("WebSocket Hub dimulai")
+
+	// 7. REPOSITORIES
 	authRepo := repository.NewAuthRepository(db)
 	pickupRepo := repository.NewPickupRepository(db)
 	collectorRepo := repository.NewCollectorRepository(db)
@@ -95,46 +78,30 @@ func main() {
 	categoryRepo := repository.NewCategoryRepository(db)
 	pointLogRepo := repository.NewPointLogRepository(db)
 
-	// ============================================================
-	// 7. INISIALISASI SERVICES
-	// ============================================================
-	authService := service.NewAuthService(authRepo, jwtManager, cfg.Bcrypt.Cost)
-
+	// 8. SERVICES
 	badgeService := service.NewBadgeService(badgeRepo)
 
+	// Assignment service dengan WebSocket notifier
 	assignmentService := service.NewAssignmentService(
-		pickupRepo,
-		collectorRepo,
-		db,
-		cfg.Worker.AssignmentTimeout,
+		pickupRepo, collectorRepo, authRepo,
+		db, cfg.Worker.AssignmentTimeout, wsNotifier,
 	)
 
 	pickupService := service.NewPickupService(pickupRepo, assignmentService, storageClient)
 
 	collectorService := service.NewCollectorService(
-		authRepo,
-		pickupRepo,
-		categoryRepo,
-		pointLogRepo,
-		badgeService,
-		db,
+		authRepo, pickupRepo, categoryRepo, pointLogRepo, badgeService, db,
 	)
+	// Inject WebSocket notifier ke collector service
+	//ini masih bermasalah barisnya
+	collectorService.SetNotifier(wsNotifier)
 
+	authService := service.NewAuthService(authRepo, jwtManager, cfg.Bcrypt.Cost)
 	reportService := service.NewReportService(reportRepo, authRepo, badgeService, storageClient)
 	feedbackService := service.NewFeedbackService(feedbackRepo, pickupRepo)
+	adminService := service.NewAdminService(authRepo, pickupRepo, reportRepo, feedbackRepo, collectorRepo, cfg.Bcrypt.Cost)
 
-	adminService := service.NewAdminService(
-		authRepo,
-		pickupRepo,
-		reportRepo,
-		feedbackRepo,
-		collectorRepo,
-		cfg.Bcrypt.Cost,
-	)
-
-	// ============================================================
-	// 8. INISIALISASI HANDLERS
-	// ============================================================
+	// 9. HANDLERS
 	authHandler := handler.NewAuthHandler(authService, cfg.App.AdminSecret)
 	pickupHandler := handler.NewPickupHandler(pickupService)
 	collectorHandler := handler.NewCollectorHandler(collectorService)
@@ -144,12 +111,8 @@ func main() {
 	adminHandler := handler.NewAdminHandler(adminService)
 	categoryHandler := handler.NewCategoryHandler(categoryRepo)
 
-	// ============================================================
-	// 9. SETUP ROUTER
-	// ============================================================
+	// 10. ROUTER
 	router := gin.New()
-
-	// Global middleware
 	router.Use(middleware.Recovery())
 	router.Use(middleware.Logger())
 	router.Use(middleware.CORS(cfg.CORS.AllowedOrigins))
@@ -157,27 +120,29 @@ func main() {
 
 	// Health check
 	router.GET("/health", func(c *gin.Context) {
+		stats := wsNotifier.GetStats()
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "ok",
 			"service": "EcoTracker V2.0",
 			"time":    time.Now().Format(time.RFC3339),
+			"ws":      stats,
 		})
 	})
 
+	// WebSocket endpoint (butuh auth)
+	router.GET("/ws", middleware.AuthMiddleware(jwtManager), wsHandler.ServeWS)
+
 	// API v1
 	v1 := router.Group("/api/v1")
-	setupRoutes(v1, authHandler, pickupHandler, collectorHandler, badgeHandler, reportHandler, feedbackHandler, adminHandler, categoryHandler, jwtManager)
+	setupRoutes(v1, authHandler, pickupHandler, collectorHandler, badgeHandler,
+		reportHandler, feedbackHandler, adminHandler, categoryHandler, jwtManager)
 
-	// ============================================================
-	// 10. JALANKAN BACKGROUND WORKERS
-	// ============================================================
+	// 11. WORKERS
 	assignmentWorker := worker.NewAssignmentWorker(assignmentService, pickupRepo, cfg.Worker.TimeoutCheckInterval)
 	assignmentWorker.Start()
 	defer assignmentWorker.Stop()
 
-	// ============================================================
-	// 11. JALANKAN HTTP SERVER
-	// ============================================================
+	// 12. START SERVER
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.App.Port),
 		Handler:      router,
@@ -186,7 +151,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Jalankan server di goroutine terpisah
 	go func() {
 		logrus.WithField("port", cfg.App.Port).Info("Server berjalan")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -194,26 +158,17 @@ func main() {
 		}
 	}()
 
-	// ============================================================
-	// 12. GRACEFUL SHUTDOWN
-	// ============================================================
+	// 13. GRACEFUL SHUTDOWN
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
 	logrus.Info("Mematikan server...")
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		logrus.WithError(err).Error("Server shutdown paksa")
-	}
-
+	srv.Shutdown(ctx)
 	logrus.Info("Server berhenti")
 }
 
-// setupRoutes mendefinisikan semua route API
 func setupRoutes(
 	v1 *gin.RouterGroup,
 	authHandler *handler.AuthHandler,
@@ -231,23 +186,21 @@ func setupRoutes(
 	requireCollector := middleware.RequireRole(domain.RoleCollector)
 	requireAdmin := middleware.RequireRole(domain.RoleAdmin)
 
-	// ── AUTH ──────────────────────────────────────────────────
+	// Auth
 	authGroup := v1.Group("/auth")
 	{
 		authGroup.POST("/register", authHandler.Register)
 		authGroup.POST("/login", authHandler.Login)
 		authGroup.POST("/refresh", authHandler.RefreshToken)
 		authGroup.GET("/profile", auth, authHandler.GetProfile)
-
-		// Endpoint khusus untuk membuat akun admin & collector (butuh X-Admin-Secret header)
 		authGroup.POST("/register-admin", authHandler.RegisterAdmin)
 		authGroup.POST("/register-collector", authHandler.RegisterCollector)
 	}
 
-	// ── CATEGORIES (public) ───────────────────────────────────
+	// Categories (public)
 	v1.GET("/categories", categoryHandler.GetAllCategories)
 
-	// ── PICKUPS (User) ────────────────────────────────────────
+	// Pickups
 	pickupGroup := v1.Group("/pickups", auth)
 	{
 		pickupGroup.POST("", requireUser, pickupHandler.CreatePickup)
@@ -255,7 +208,7 @@ func setupRoutes(
 		pickupGroup.GET("/:id", pickupHandler.GetPickupDetail)
 	}
 
-	// ── COLLECTOR ─────────────────────────────────────────────
+	// Collector
 	collectorGroup := v1.Group("/collector", auth, requireCollector)
 	{
 		collectorGroup.PUT("/status", collectorHandler.UpdateStatus)
@@ -267,14 +220,14 @@ func setupRoutes(
 		collectorGroup.POST("/pickups/:id/complete", collectorHandler.CompletePickup)
 	}
 
-	// ── BADGES ────────────────────────────────────────────────
+	// Badges
 	badgeGroup := v1.Group("/badges", auth)
 	{
 		badgeGroup.GET("", badgeHandler.GetAllBadges)
 		badgeGroup.GET("/my", badgeHandler.GetMyBadges)
 	}
 
-	// ── REPORTS ───────────────────────────────────────────────
+	// Reports
 	reportGroup := v1.Group("/reports", auth)
 	{
 		reportGroup.POST("", requireUser, reportHandler.CreateReport)
@@ -282,31 +235,23 @@ func setupRoutes(
 		reportGroup.GET("/:id", reportHandler.GetReportDetail)
 	}
 
-	// ── FEEDBACK ──────────────────────────────────────────────
+	// Feedback
 	feedbackGroup := v1.Group("/feedback", auth)
 	{
 		feedbackGroup.POST("", requireUser, feedbackHandler.CreateFeedback)
 		feedbackGroup.GET("/my", feedbackHandler.GetMyFeedback)
 	}
 
-	// ── ADMIN ─────────────────────────────────────────────────
+	// Admin
 	adminGroup := v1.Group("/admin", auth, requireAdmin)
 	{
 		adminGroup.GET("/dashboard", adminHandler.GetDashboard)
-
-		// Collector management
 		adminGroup.GET("/collectors", adminHandler.ListCollectors)
 		adminGroup.POST("/collectors", adminHandler.CreateCollector)
 		adminGroup.DELETE("/collectors/:id", adminHandler.DeleteCollector)
-
-		// Pickup monitoring
 		adminGroup.GET("/pickups", adminHandler.ListPickups)
-
-		// Report management
 		adminGroup.GET("/reports", adminHandler.ListReports)
 		adminGroup.PUT("/reports/:id", adminHandler.UpdateReport)
-
-		// Feedback management
 		adminGroup.GET("/feedback", adminHandler.ListFeedback)
 		adminGroup.PUT("/feedback/:id/respond", adminHandler.RespondToFeedback)
 	}
