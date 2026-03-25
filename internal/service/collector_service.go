@@ -7,17 +7,24 @@ import (
 
 	"github.com/ecotracker/backend/internal/domain"
 	"github.com/ecotracker/backend/internal/repository"
+	ws "github.com/ecotracker/backend/internal/websocket"
 	"github.com/sirupsen/logrus"
 )
 
 // CollectorService mengelola logika bisnis untuk collector
 type CollectorService struct {
-	authRepo      *repository.AuthRepository
-	pickupRepo    *repository.PickupRepository
-	categoryRepo  *repository.CategoryRepository
-	pointLogRepo  *repository.PointLogRepository
-	badgeService  *BadgeService
-	db            *sql.DB
+	authRepo     *repository.AuthRepository
+	pickupRepo   *repository.PickupRepository
+	categoryRepo *repository.CategoryRepository
+	pointLogRepo *repository.PointLogRepository
+	badgeService *BadgeService
+	db           *sql.DB
+	notifier     *ws.Notifier
+}
+
+// SetNotifier meng-inject WebSocket notifier ke CollectorService
+func (s *CollectorService) SetNotifier(n *ws.Notifier) {
+	s.notifier = n
 }
 
 func NewCollectorService(
@@ -60,12 +67,10 @@ func (s *CollectorService) AcceptPickup(ctx context.Context, collectorID, pickup
 		return nil, err
 	}
 
-	// Validasi: pickup harus ditugaskan ke collector ini
 	if pickup.CollectorID == nil || *pickup.CollectorID != collectorID {
 		return nil, domain.ErrForbidden
 	}
 
-	// Validasi status
 	if pickup.Status != domain.StatusAssigned && pickup.Status != domain.StatusReassigned {
 		return nil, domain.ErrInvalidPickupStatus
 	}
@@ -109,26 +114,11 @@ func (s *CollectorService) ArriveAtPickup(ctx context.Context, collectorID, pick
 	return s.pickupRepo.GetByID(ctx, pickupID)
 }
 
-// CompletePickup menyelesaikan pickup secara atomik:
-// 1. Hitung total berat dan poin
-// 2. Simpan pickup_items
-// 3. Update pickup status = completed
-// 4. Beri poin ke user
-// 5. Lepas collector (is_busy = false)
-// 6. Update weight collected collector
-// 7. Cek & berikan badge
+// CompletePickup menyelesaikan pickup secara atomik
 func (s *CollectorService) CompletePickup(ctx context.Context, collectorID, pickupID string, req *domain.CompletePickupRequest) (*domain.Pickup, error) {
 	pickup, err := s.validateCollectorPickup(ctx, collectorID, pickupID, domain.StatusArrived)
 	if err != nil {
 		return nil, err
-	}
-
-	// Hitung poin per item
-	type itemResult struct {
-		PickupID   string
-		CategoryID string
-		WeightKg   float64
-		Points     int
 	}
 
 	var totalWeight float64
@@ -158,48 +148,40 @@ func (s *CollectorService) CompletePickup(ctx context.Context, collectorID, pick
 		}{pickupID, item.CategoryID, item.WeightKg, points})
 	}
 
-	// Mulai transaksi atomik
 	tx, err := s.pickupRepo.BeginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mulai transaksi: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 1. Selesaikan pickup
 	if err := s.pickupRepo.CompletePickup(ctx, tx, pickupID, totalWeight, totalPoints); err != nil {
 		return nil, fmt.Errorf("complete pickup: %w", err)
 	}
 
-	// 2. Simpan pickup items
 	if err := s.pickupRepo.AddPickupItems(ctx, tx, itemResults); err != nil {
 		return nil, fmt.Errorf("simpan items: %w", err)
 	}
 
-	// 3. Tambah poin user
 	newBalance, err := s.authRepo.UpdatePoints(ctx, tx, pickup.UserID, totalPoints)
 	if err != nil {
 		return nil, fmt.Errorf("tambah poin: %w", err)
 	}
 
-	// 4. Catat point log
 	desc := fmt.Sprintf("Poin dari pickup #%s (%.2f kg)", pickupID[:8], totalWeight)
 	if err := s.pointLogRepo.Create(ctx, tx, pickup.UserID, &pickupID, domain.PointEarned, totalPoints, desc, newBalance); err != nil {
 		return nil, fmt.Errorf("catat point log: %w", err)
 	}
 
-	// 5. Increment pickup counter user
 	totalPickups, err := s.authRepo.IncrementPickupsCompleted(ctx, tx, pickup.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("increment pickups: %w", err)
 	}
 
-	// 6. Lepas collector (is_busy = false)
 	_, err = tx.ExecContext(ctx, `UPDATE profiles SET is_busy = false WHERE id = $1`, collectorID)
 	if err != nil {
 		return nil, fmt.Errorf("lepas collector: %w", err)
 	}
 
-	// 7. Tambah weight collected collector
 	if err := s.authRepo.AddWeightCollected(ctx, tx, collectorID, totalWeight); err != nil {
 		return nil, fmt.Errorf("update weight collector: %w", err)
 	}
@@ -208,7 +190,6 @@ func (s *CollectorService) CompletePickup(ctx context.Context, collectorID, pick
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 
-	// 8. Cek & berikan badge (async, tidak blokir)
 	go func() {
 		bgCtx := context.Background()
 		if err := s.badgeService.CheckAndAwardBadges(bgCtx, pickup.UserID, totalPickups, newBalance); err != nil {
