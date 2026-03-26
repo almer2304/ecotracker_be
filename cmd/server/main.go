@@ -26,6 +26,7 @@ func main() {
 	// 1. LOGGING
 	logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: "2006-01-02 15:04:05"})
 	logrus.SetLevel(logrus.InfoLevel)
+	gin.SetMode(gin.ReleaseMode)
 
 	// 2. CONFIG
 	cfg, err := config.Load()

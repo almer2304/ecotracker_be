@@ -16,10 +16,8 @@ import (
 // RATE LIMITER
 // ============================================================
 
-// RateLimiter membatasi jumlah request per IP menggunakan token bucket dengan Redis
 func RateLimiter(redisClient *redis.Client, maxRequests int, window time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Jika Redis tidak tersedia, skip rate limiting
 		if redisClient == nil {
 			c.Next()
 			return
@@ -29,20 +27,16 @@ func RateLimiter(redisClient *redis.Client, maxRequests int, window time.Duratio
 		key := fmt.Sprintf("rate_limit:%s", ip)
 		ctx := context.Background()
 
-		// Increment counter
 		count, err := redisClient.Incr(ctx, key).Result()
 		if err != nil {
-			// Redis error - izinkan request tetap jalan
 			c.Next()
 			return
 		}
 
-		// Set TTL hanya pada request pertama dalam window
 		if count == 1 {
 			redisClient.Expire(ctx, key, window)
 		}
 
-		// Tambahkan header info rate limit
 		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", maxRequests))
 		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", maxRequests-int(count)))
 
@@ -63,7 +57,6 @@ func RateLimiter(redisClient *redis.Client, maxRequests int, window time.Duratio
 // CORS
 // ============================================================
 
-// CORS mengizinkan cross-origin requests dari origins yang terdaftar
 func CORS(allowedOrigins string) gin.HandlerFunc {
 	origins := strings.Split(allowedOrigins, ",")
 	originMap := make(map[string]bool)
@@ -74,7 +67,6 @@ func CORS(allowedOrigins string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 
-		// Cek apakah origin diizinkan
 		if originMap[origin] || allowedOrigins == "*" {
 			c.Header("Access-Control-Allow-Origin", origin)
 		}
@@ -94,43 +86,85 @@ func CORS(allowedOrigins string) gin.HandlerFunc {
 }
 
 // ============================================================
-// LOGGER
+// LOGGER — lebih bersih & filter noise
 // ============================================================
 
-// Logger mencatat setiap HTTP request dengan logrus
+// path yang di-skip dari logging (terlalu banyak noise)
+var skipLogPaths = map[string]bool{
+	"/health": true,
+}
+
 func Logger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
-		raw := c.Request.URL.RawQuery
+		query := c.Request.URL.RawQuery
 
 		c.Next()
 
-		latency := time.Since(start)
+		// Skip path yang tidak perlu di-log
+		if skipLogPaths[path] {
+			return
+		}
+
+		// Skip OPTIONS preflight — tidak informatif
+		if c.Request.Method == http.MethodOptions {
+			return
+		}
+
+		// Skip WebSocket yang gagal upgrade (401) — ini noise dari reconnect loop
+		// Hanya log WS yang berhasil (101 Switching Protocols)
 		statusCode := c.Writer.Status()
+		if path == "/ws" && statusCode != http.StatusSwitchingProtocols {
+			// Log hanya sekali per menit per IP untuk WS failure (suppress spam)
+			// Cukup debug level saja
+			logrus.WithFields(logrus.Fields{
+				"status": statusCode,
+				"ip":     c.ClientIP(),
+			}).Debug("WS connect gagal")
+			return
+		}
+
+		latency := time.Since(start)
+
+		// Bangun query string yang bersih (sembunyikan token di URL)
+		cleanQuery := query
+		if strings.Contains(query, "token=") {
+			cleanQuery = "[token hidden]"
+		}
 
 		entry := logrus.WithFields(logrus.Fields{
 			"status":     statusCode,
 			"method":     c.Request.Method,
 			"path":       path,
-			"query":      raw,
-			"ip":         c.ClientIP(),
 			"latency_ms": latency.Milliseconds(),
-			"user_agent": c.Request.UserAgent(),
+			"ip":         c.ClientIP(),
 		})
 
+		// Tambah query hanya kalau ada dan bukan token
+		if cleanQuery != "" {
+			entry = entry.WithField("query", cleanQuery)
+		}
+
+		// Tambah user_id kalau ada
 		if userID, exists := c.Get(ContextUserID); exists {
 			entry = entry.WithField("user_id", userID)
 		}
 
-		if len(c.Errors) > 0 {
-			entry.Error(c.Errors.String())
-		} else if statusCode >= 500 {
+		switch {
+		case len(c.Errors) > 0:
+			entry.WithField("errors", c.Errors.String()).Error("Handler error")
+		case statusCode >= 500:
 			entry.Error("Server error")
-		} else if statusCode >= 400 {
-			entry.Warn("Client error")
-		} else {
-			entry.Info("Request selesai")
+		case statusCode >= 400:
+			// Jangan log 401 sebagai warning — terlalu banyak noise dari token expired
+			if statusCode == 401 {
+				entry.Debug("Unauthorized")
+			} else {
+				entry.Warn("Client error")
+			}
+		default:
+			entry.Info("OK")
 		}
 	}
 }
@@ -139,7 +173,6 @@ func Logger() gin.HandlerFunc {
 // RECOVERY
 // ============================================================
 
-// Recovery menangani panic dan mengembalikan response 500
 func Recovery() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {

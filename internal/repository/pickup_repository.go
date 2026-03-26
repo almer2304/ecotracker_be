@@ -325,6 +325,34 @@ func (r *PickupRepository) FindExpiredAssignments(ctx context.Context) ([]domain
 	return pickups, rows.Err()
 }
 
+// FindPendingPickups mencari pickup yang masih menunggu collector
+func (r *PickupRepository) FindPendingPickups(ctx context.Context) ([]domain.Pickup, error) {
+	query := `
+		SELECT id, user_id, collector_id, lat, lon, reassignment_count
+		FROM pickups
+		WHERE status = 'pending'
+		  AND deleted_at IS NULL
+		ORDER BY created_at ASC
+		LIMIT 10`
+
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pickups []domain.Pickup
+	for rows.Next() {
+		var p domain.Pickup
+		err := rows.Scan(&p.ID, &p.UserID, &p.CollectorID, &p.Lat, &p.Lon, &p.ReassignmentCount)
+		if err != nil {
+			return nil, err
+		}
+		pickups = append(pickups, p)
+	}
+	return pickups, rows.Err()
+}
+
 // GetAssignedPickupByCollector mencari pickup yang sedang ditangani collector
 func (r *PickupRepository) GetAssignedPickupByCollector(ctx context.Context, collectorID string) (*domain.Pickup, error) {
 	query := `

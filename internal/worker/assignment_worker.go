@@ -10,7 +10,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// AssignmentWorker adalah background worker lengkap yang mengelola timeout & reassignment
 type AssignmentWorker struct {
 	assignmentService *service.AssignmentService
 	pickupRepo        *repository.PickupRepository
@@ -31,14 +30,12 @@ func NewAssignmentWorker(
 	}
 }
 
-// Start menjalankan worker di background goroutine
 func (w *AssignmentWorker) Start() {
 	go func() {
 		logrus.WithField("interval", w.interval).Info("AssignmentWorker dimulai")
 		ticker := time.NewTicker(w.interval)
 		defer ticker.Stop()
 
-		// Jalankan sekali langsung saat startup
 		w.run()
 
 		for {
@@ -53,22 +50,26 @@ func (w *AssignmentWorker) Start() {
 	}()
 }
 
-// Stop menghentikan worker secara graceful
 func (w *AssignmentWorker) Stop() {
 	select {
 	case <-w.done:
-		// Sudah ditutup
 	default:
 		close(w.done)
 	}
 }
 
-// run mengecek expired assignments dan melakukan reassignment
 func (w *AssignmentWorker) run() {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	// Temukan pickup yang sudah timeout
+	// 1. Handle expired assignments (sudah ada sebelumnya)
+	w.handleExpiredAssignments(ctx)
+
+	// 2. Handle pending pickups yang belum dapat collector ← INI YANG BARU
+	w.handlePendingPickups(ctx)
+}
+
+func (w *AssignmentWorker) handleExpiredAssignments(ctx context.Context) {
 	expiredPickups, err := w.pickupRepo.FindExpiredAssignments(ctx)
 	if err != nil {
 		logrus.WithError(err).Error("AssignmentWorker: gagal mencari expired assignments")
@@ -83,16 +84,13 @@ func (w *AssignmentWorker) run() {
 
 	for i := range expiredPickups {
 		pickup := expiredPickups[i]
-
 		log := logrus.WithFields(logrus.Fields{
 			"pickup_id":          pickup.ID,
-			"collector_id":       pickup.CollectorID,
 			"reassignment_count": pickup.ReassignmentCount,
 		})
 
-		// Batasi maksimum 5x reassignment untuk mencegah infinite loop
 		if pickup.ReassignmentCount >= 5 {
-			log.Warn("Pickup telah melewati batas reassignment, ubah ke pending")
+			log.Warn("Pickup melewati batas reassignment, kembali ke pending")
 			w.pickupRepo.UpdateStatus(ctx, pickup.ID, domain.StatusPending, nil)
 			continue
 		}
@@ -101,6 +99,33 @@ func (w *AssignmentWorker) run() {
 			log.WithError(err).Error("Gagal reassign pickup")
 		} else {
 			log.Info("Pickup berhasil di-reassign")
+		}
+	}
+}
+
+// handlePendingPickups mencoba assign pickup yang masih pending ke collector yang baru online
+func (w *AssignmentWorker) handlePendingPickups(ctx context.Context) {
+	pendingPickups, err := w.pickupRepo.FindPendingPickups(ctx)
+	if err != nil {
+		logrus.WithError(err).Error("AssignmentWorker: gagal mencari pending pickups")
+		return
+	}
+
+	if len(pendingPickups) == 0 {
+		return
+	}
+
+	logrus.WithField("jumlah", len(pendingPickups)).Info("AssignmentWorker: mencoba assign pending pickups")
+
+	for i := range pendingPickups {
+		pickup := pendingPickups[i]
+		log := logrus.WithField("pickup_id", pickup.ID)
+
+		// Gunakan AssignPickup langsung — sama seperti saat pickup pertama dibuat
+		if err := w.assignmentService.AssignClosestCollector(ctx, pickup.ID, pickup.Lat, pickup.Lon, []string{}); err != nil {
+			log.WithField("reason", err.Error()).Debug("Pending pickup belum bisa di-assign")
+		} else {
+			log.Info("Pending pickup berhasil di-assign ke collector baru")
 		}
 	}
 }
