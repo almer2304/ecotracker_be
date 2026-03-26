@@ -219,6 +219,7 @@ func setupRoutes(
 		collectorGroup.POST("/pickups/:id/start", collectorHandler.StartPickup)
 		collectorGroup.POST("/pickups/:id/arrive", collectorHandler.ArriveAtPickup)
 		collectorGroup.POST("/pickups/:id/complete", collectorHandler.CompletePickup)
+		collectorGroup.GET("/history", collectorHandler.GetHistory)
 	}
 
 	// Badges

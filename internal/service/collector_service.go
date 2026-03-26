@@ -60,6 +60,11 @@ func (s *CollectorService) GetAssignedPickup(ctx context.Context, collectorID st
 	return s.pickupRepo.GetAssignedPickupByCollector(ctx, collectorID)
 }
 
+func (s *CollectorService) GetHistory(ctx context.Context, collectorID string, page, limit int) ([]*domain.Pickup, int, error) {
+	offset := (page - 1) * limit
+	return s.pickupRepo.GetCollectorHistory(ctx, collectorID, limit, offset)
+}
+
 // AcceptPickup collector menerima pickup yang ditugaskan
 func (s *CollectorService) AcceptPickup(ctx context.Context, collectorID, pickupID string) (*domain.Pickup, error) {
 	pickup, err := s.pickupRepo.GetByID(ctx, pickupID)

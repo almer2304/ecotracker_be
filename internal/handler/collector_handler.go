@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/ecotracker/backend/internal/domain"
 	"github.com/ecotracker/backend/internal/middleware"
@@ -147,4 +148,18 @@ func (h *CollectorHandler) CompletePickup(c *gin.Context) {
 	}
 
 	utils.Success(c, http.StatusOK, "Pickup selesai! Poin telah diberikan ke user", pickup)
+}
+
+func (h *CollectorHandler) GetHistory(c *gin.Context) {
+	collectorID := middleware.GetUserID(c)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+ 
+	pickups, total, err := h.collectorService.GetHistory(c.Request.Context(), collectorID, page, limit)
+	if err != nil {
+		utils.HandleError(c, err)
+		return
+	}
+ 
+	utils.Success(c, http.StatusOK, "Berhasil", utils.BuildListResponse(pickups, total, page, limit))
 }

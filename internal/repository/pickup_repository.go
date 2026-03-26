@@ -398,6 +398,63 @@ func (r *PickupRepository) GetAssignedPickupByCollector(ctx context.Context, col
 	return &p, nil
 }
 
+
+
+func (r *PickupRepository) GetCollectorHistory(ctx context.Context, collectorID string, limit, offset int) ([]*domain.Pickup, int, error) {
+	var total int
+	countQuery := `
+		SELECT COUNT(*) FROM pickups
+		WHERE collector_id = $1
+		  AND status = 'completed'
+		  AND deleted_at IS NULL`
+	if err := r.db.QueryRowContext(ctx, countQuery, collectorID).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count collector history: %w", err)
+	}
+ 
+	query := `
+		SELECT p.id, p.user_id, p.collector_id, p.address, p.lat, p.lon,
+		       p.photo_url, p.notes, p.status,
+		       p.assigned_at, p.assignment_timeout, p.reassignment_count,
+		       p.accepted_at, p.started_at, p.arrived_at, p.completed_at,
+		       p.total_weight, p.total_points_awarded, p.created_at, p.updated_at,
+		       u.name AS user_name, u.phone AS user_phone
+		FROM pickups p
+		JOIN profiles u ON u.id = p.user_id
+		WHERE p.collector_id = $1
+		  AND p.status = 'completed'
+		  AND p.deleted_at IS NULL
+		ORDER BY p.completed_at DESC
+		LIMIT $2 OFFSET $3`
+ 
+	rows, err := r.db.QueryContext(ctx, query, collectorID, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("GetCollectorHistory: %w", err)
+	}
+	defer rows.Close()
+ 
+	var pickups []*domain.Pickup
+	for rows.Next() {
+		var p domain.Pickup
+		var userName, userPhone sql.NullString
+		err := rows.Scan(
+			&p.ID, &p.UserID, &p.CollectorID, &p.Address, &p.Lat, &p.Lon,
+			&p.PhotoURL, &p.Notes, &p.Status,
+			&p.AssignedAt, &p.AssignmentTimeout, &p.ReassignmentCount,
+			&p.AcceptedAt, &p.StartedAt, &p.ArrivedAt, &p.CompletedAt,
+			&p.TotalWeight, &p.TotalPointsAwarded, &p.CreatedAt, &p.UpdatedAt,
+			&userName, &userPhone,
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+		p.User = &domain.Profile{ID: p.UserID}
+		if userName.Valid { p.User.Name = userName.String }
+		if userPhone.Valid { phone := userPhone.String; p.User.Phone = &phone }
+		pickups = append(pickups, &p)
+	}
+	return pickups, total, rows.Err()
+}
+
 // BeginTx memulai database transaction
 func (r *PickupRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
 	return r.db.BeginTx(ctx, nil)
